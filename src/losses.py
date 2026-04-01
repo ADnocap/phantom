@@ -133,6 +133,28 @@ def crps_loss(
     return crps.mean()
 
 
+def quantile_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    quantiles: list[float],
+) -> torch.Tensor:
+    """Pinball (quantile) loss.
+
+    Args:
+        pred:      (B, Q) predicted quantile values.
+        target:    (B,)   observed cumulative log-return.
+        quantiles: list of Q quantile levels (e.g. [0.01, ..., 0.99]).
+
+    Returns:
+        Scalar mean pinball loss.
+    """
+    target = target.unsqueeze(-1)  # (B, 1)
+    tau = torch.tensor(quantiles, device=pred.device, dtype=pred.dtype).unsqueeze(0)  # (1, Q)
+    errors = target - pred  # (B, Q)
+    loss = torch.where(errors >= 0, tau * errors, (tau - 1) * errors)
+    return loss.mean()
+
+
 def entropy_regularization(log_pi: torch.Tensor) -> torch.Tensor:
     """Negative entropy of mixture weights — minimize to encourage uniform usage.
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=phantom-v2
+#SBATCH --job-name=phantom-mog
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpua100
@@ -7,21 +7,17 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --mem-per-cpu=20G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/train_v2_%j.out
-#SBATCH --error=logs/train_v2_%j.err
+#SBATCH --output=logs/train_mog_%j.out
+#SBATCH --error=logs/train_mog_%j.err
 
-# ─── Phantom v2: Fixed RevIN + CRPS-dominant + sharpness ─────────────
-# Fresh start with architectural fixes:
-#   - Stat injection (RevIN stats passed to MoG head)
-#   - K=5, sigma_max=1.0
-#   - CRPS-dominant (alpha=2.0)
-#   - Entropy reg + sharpness penalty
+# ─── Option A: MeanAbsScaling + MoG (K=5) ────────────────────────────
+# No RevIN — preserves sign/shape/trends in the input
+# CRPS-dominant loss + entropy reg + sharpness penalty
 
 WORKDIR=/gpfs/workdir/dalbanal
 PROJECT=$WORKDIR/phantom
-
 cd $PROJECT
-mkdir -p logs checkpoints_v2
+mkdir -p logs checkpoints_mog
 
 module load apptainer/1.4.4/gcc-15.1.0
 
@@ -40,6 +36,7 @@ apptainer exec --nv --writable-tmpfs \
     --n_layers 8 \
     --d_ff 2048 \
     --n_components 5 \
+    --head_type mog \
     --dropout 0.2 \
     --epochs 9 \
     --batch_size 512 \
@@ -56,6 +53,6 @@ apptainer exec --nv --writable-tmpfs \
     --save_every 5000 \
     --log_every 100 \
     --val_samples 4096 \
-    --checkpoint_dir checkpoints_v2/ \
-    --log_dir logs_v2/ \
+    --checkpoint_dir checkpoints_mog/ \
+    --log_dir logs_mog/ \
     --seed 42

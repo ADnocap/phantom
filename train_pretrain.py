@@ -32,7 +32,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.model import PhantomConfig, PhantomModel
-from src.losses import combined_loss
+from src.losses import combined_loss, quantile_loss
 from src.data import ShardDataset, OnlineDataset, make_validation_batch
 
 
@@ -89,6 +89,7 @@ def validate(model, val_x, val_h, val_y, device, alpha,
              entropy_coeff=0.01, sharpness_coeff=0.1, batch_size=512):
     """Run validation on a fixed synthetic batch."""
     model.eval()
+    head_type = model.cfg.head_type
     n = val_x.size(0)
     total_loss, total_nll, total_crps = 0.0, 0.0, 0.0
     n_batches = 0
@@ -98,14 +99,20 @@ def validate(model, val_x, val_h, val_y, device, alpha,
         h = val_h[i:i+batch_size].to(device)
         y = val_y[i:i+batch_size].to(device)
 
-        log_pi, mu, sigma = model(x, h)
-        loss, nll, crps = combined_loss(log_pi, mu, sigma, y, alpha=alpha,
-                                        entropy_coeff=entropy_coeff,
-                                        sharpness_coeff=sharpness_coeff)
-
-        total_loss += loss.item()
-        total_nll += nll.item()
-        total_crps += crps.item()
+        if head_type == 'quantile':
+            q_pred = model(x, h)
+            loss = quantile_loss(q_pred, y, model.cfg.quantiles)
+            total_loss += loss.item()
+            total_nll += loss.item()
+            total_crps += loss.item()
+        else:
+            log_pi, mu, sigma = model(x, h)
+            loss, nll, crps = combined_loss(log_pi, mu, sigma, y, alpha=alpha,
+                                            entropy_coeff=entropy_coeff,
+                                            sharpness_coeff=sharpness_coeff)
+            total_loss += loss.item()
+            total_nll += nll.item()
+            total_crps += crps.item()
         n_batches += 1
 
     model.train()
@@ -163,7 +170,9 @@ def parse_args():
     p.add_argument('--n_layers', type=int, default=6)
     p.add_argument('--d_ff', type=int, default=1024)
     p.add_argument('--dropout', type=float, default=0.2)
-    p.add_argument('--n_components', type=int, default=8)
+    p.add_argument('--n_components', type=int, default=5)
+    p.add_argument('--head_type', type=str, default='mog', choices=['mog', 'quantile'],
+                   help='Forecast head: mog (Mixture of Gaussians) or quantile')
 
     # Training
     p.add_argument('--epochs', type=int, default=30)
@@ -231,6 +240,7 @@ def main():
         d_ff=args.d_ff,
         dropout=args.dropout,
         n_components=args.n_components,
+        head_type=args.head_type,
     )
 
     model = PhantomModel(cfg).to(device)
@@ -352,10 +362,16 @@ def main():
 
             # ── Forward + loss ──
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                log_pi, mu, sigma = model(x, h)
-                loss, nll, crps = combined_loss(log_pi, mu, sigma, y, alpha=args.alpha,
-                                                entropy_coeff=args.entropy_coeff,
-                                                sharpness_coeff=args.sharpness_coeff)
+                if args.head_type == 'quantile':
+                    q_pred = model(x, h)
+                    loss = quantile_loss(q_pred, y, cfg.quantiles)
+                    nll = loss
+                    crps = loss
+                else:
+                    log_pi, mu, sigma = model(x, h)
+                    loss, nll, crps = combined_loss(log_pi, mu, sigma, y, alpha=args.alpha,
+                                                    entropy_coeff=args.entropy_coeff,
+                                                    sharpness_coeff=args.sharpness_coeff)
                 loss = loss / args.grad_accum
 
             # ── Backward ──
