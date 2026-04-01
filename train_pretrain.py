@@ -423,15 +423,15 @@ def main():
         # ── End of epoch ──
         print(f"\n--- Epoch {epoch+1}/{args.epochs} complete (step {global_step}) ---\n")
 
-        # Epoch checkpoint
+        # Save latest at end of epoch
         save_checkpoint(
-            ckpt_dir / f"epoch_{epoch+1}.pt", model, optimizer, scaler,
+            ckpt_dir / "latest.pt", model, optimizer, scaler,
             global_step, epoch + 1, cfg, best_val_loss,
         )
 
-    # ── Final ──
+    # ── Final → save as latest ──
     save_checkpoint(
-        ckpt_dir / "final.pt", model, optimizer, scaler,
+        ckpt_dir / "latest.pt", model, optimizer, scaler,
         global_step, args.epochs, cfg, best_val_loss,
     )
 

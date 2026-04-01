@@ -102,7 +102,7 @@ def generate_shard(
                 offset += n
                 pbar.update(n)
 
-    np.savez_compressed(output_path, X=X, H=H, Y=Y)
+    np.savez(output_path, X=X, H=H, Y=Y)
     size_gb = output_path.stat().st_size / 1e9
     print(f"  Saved {output_path} ({size_gb:.2f} GB, {n_samples:,} samples)")
 
