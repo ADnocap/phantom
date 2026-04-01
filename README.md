@@ -4,6 +4,32 @@ _Adapting the methodology from [JointFM-0.1 (Hackmann, 2026)](https://arxiv.org/
 
 ---
 
+## 0. Lessons Learned & Current Approach
+
+### The RevIN Problem (Resolved)
+
+Early versions used RevIN (Reversible Instance Normalization) from PatchTST. This produced **perfect calibration** (PIT histogram near-uniform, coverage within 1% of targets at all levels) but the model predicted the **marginal distribution regardless of input** — CRPS was 3x worse than a naive Gaussian baseline.
+
+**Root cause**: RevIN normalizes every input to mean=0, std=1, then denormalizes the output. For GBM paths, normalized returns are i.i.d. standard normal — the transformer sees identical distributions for every sample. The model learns a constant prediction in normalized space, and RevIN.inverse() provides correct scale/location "for free."
+
+**Finding**: JointFM (the paper this project is based on) uses **no normalization at all**. The model sees raw log-returns and must learn to produce scale-appropriate distribution parameters from the input context. We now follow this approach.
+
+### The Single-Scalar Target Problem (Resolved)
+
+The original implementation used a single future realization as the training target (Y = cumulative log-return). With NLL loss on a Mixture of Gaussians, predicting the marginal distribution is a stable local minimum — the gradient from one point is too weak to push toward conditional predictions.
+
+**Fix**: Following JointFM's data generation, we now **branch N=128 independent future paths** from each context's terminal state. The training target is the empirical conditional distribution (128 MC samples), not a single scalar. The primary loss is **energy distance** between MoG samples and the ground-truth MC samples, which directly rewards matching the conditional distribution.
+
+### Current Architecture
+
+- **No normalization** — raw log-returns as input (JointFM-style)
+- **MoG output head** (K=5 Gaussian components)
+- **Energy distance** as primary loss + auxiliary NLL (weight 0.1) for gradient flow to mixture weights
+- **Online data generation** — each training sample gets fresh SDE params + 128 branched futures
+- **Encoder-only transformer** with patched input (PatchTST-style)
+
+---
+
 ## 1. Core Idea
 
 JointFM shows that a transformer trained on **millions of synthetic stochastic trajectories** (sampled from SDEs with randomly varied parameters) can learn a general "grammar" of time-series dynamics and produce calibrated distributional forecasts at inference time — without ever fitting to the target data.

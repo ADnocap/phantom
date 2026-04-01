@@ -172,6 +172,303 @@ def _sim_regime_switching(mus, sigmas, Q, n_regimes, n_days):
     return returns
 
 
+# ── With-state variants (return terminal state for branching) ────────
+
+@njit(cache=True)
+def _sim_gbm_with_state(mu, sigma, n_days):
+    total_steps = n_days * STEPS_PER_DAY
+    log_S = 0.0
+    daily_closes = np.empty(n_days + 1)
+    daily_closes[0] = 0.0
+    day_idx = 1
+    for i in range(1, total_steps + 1):
+        dW = np.sqrt(DT) * np.random.randn()
+        log_S += (mu - 0.5 * sigma**2) * DT + sigma * dW
+        if i % STEPS_PER_DAY == 0:
+            daily_closes[day_idx] = log_S
+            day_idx += 1
+    returns = np.empty(n_days)
+    for j in range(n_days):
+        returns[j] = daily_closes[j + 1] - daily_closes[j]
+    return returns, log_S
+
+
+@njit(cache=True)
+def _sim_merton_with_state(mu, sigma, lam, mu_j, sigma_j, n_days):
+    total_steps = n_days * STEPS_PER_DAY
+    log_S = 0.0
+    daily_closes = np.empty(n_days + 1)
+    daily_closes[0] = 0.0
+    day_idx = 1
+    for i in range(1, total_steps + 1):
+        dW = np.sqrt(DT) * np.random.randn()
+        log_S += (mu - 0.5 * sigma**2) * DT + sigma * dW
+        if np.random.rand() < lam * DT:
+            log_S += np.random.normal(mu_j, sigma_j)
+        if i % STEPS_PER_DAY == 0:
+            daily_closes[day_idx] = log_S
+            day_idx += 1
+    returns = np.empty(n_days)
+    for j in range(n_days):
+        returns[j] = daily_closes[j + 1] - daily_closes[j]
+    return returns, log_S
+
+
+@njit(cache=True)
+def _sim_kou_with_state(mu, sigma, lam, eta1, eta2, p, n_days):
+    total_steps = n_days * STEPS_PER_DAY
+    log_S = 0.0
+    daily_closes = np.empty(n_days + 1)
+    daily_closes[0] = 0.0
+    day_idx = 1
+    for i in range(1, total_steps + 1):
+        dW = np.sqrt(DT) * np.random.randn()
+        log_S += (mu - 0.5 * sigma**2) * DT + sigma * dW
+        if np.random.rand() < lam * DT:
+            if np.random.rand() < p:
+                log_S += np.random.exponential(1.0 / eta1)
+            else:
+                log_S -= np.random.exponential(1.0 / eta2)
+        if i % STEPS_PER_DAY == 0:
+            daily_closes[day_idx] = log_S
+            day_idx += 1
+    returns = np.empty(n_days)
+    for j in range(n_days):
+        returns[j] = daily_closes[j + 1] - daily_closes[j]
+    return returns, log_S
+
+
+@njit(cache=True)
+def _sim_bates_with_state(mu, sigma, kappa, theta, xi, rho, lam, mu_j, sigma_j, n_days):
+    total_steps = n_days * STEPS_PER_DAY
+    log_S = 0.0
+    v = theta
+    rho_complement = np.sqrt(1.0 - rho**2)
+    daily_closes = np.empty(n_days + 1)
+    daily_closes[0] = 0.0
+    day_idx = 1
+    for i in range(1, total_steps + 1):
+        sqrt_v = np.sqrt(max(v, 0.0))
+        dW_s = np.sqrt(DT) * np.random.randn()
+        dW_v = rho * dW_s + rho_complement * np.sqrt(DT) * np.random.randn()
+        log_S += (mu - 0.5 * v) * DT + sqrt_v * dW_s
+        v += kappa * (theta - v) * DT + xi * sqrt_v * dW_v
+        v = max(v, 0.0)
+        if np.random.rand() < lam * DT:
+            log_S += np.random.normal(mu_j, sigma_j)
+        if i % STEPS_PER_DAY == 0:
+            daily_closes[day_idx] = log_S
+            day_idx += 1
+    returns = np.empty(n_days)
+    for j in range(n_days):
+        returns[j] = daily_closes[j + 1] - daily_closes[j]
+    return returns, log_S, v
+
+
+@njit(cache=True)
+def _sim_regime_switching_with_state(mus, sigmas, Q, n_regimes, n_days):
+    total_steps = n_days * STEPS_PER_DAY
+    log_S = 0.0
+    regime = 0
+    daily_closes = np.empty(n_days + 1)
+    daily_closes[0] = 0.0
+    day_idx = 1
+    for i in range(1, total_steps + 1):
+        mu = mus[regime]
+        sigma = sigmas[regime]
+        dW = np.sqrt(DT) * np.random.randn()
+        log_S += (mu - 0.5 * sigma**2) * DT + sigma * dW
+        total_rate = -Q[regime, regime]
+        if total_rate > 0 and np.random.rand() < total_rate * DT:
+            u = np.random.rand() * total_rate
+            cumulative = 0.0
+            for j in range(n_regimes):
+                if j == regime:
+                    continue
+                cumulative += Q[regime, j]
+                if u <= cumulative:
+                    regime = j
+                    break
+        if i % STEPS_PER_DAY == 0:
+            daily_closes[day_idx] = log_S
+            day_idx += 1
+    returns = np.empty(n_days)
+    for j in range(n_days):
+        returns[j] = daily_closes[j + 1] - daily_closes[j]
+    return returns, log_S, regime
+
+
+# ── Forward-batch simulators (branch N paths from terminal state) ────
+
+@njit(cache=True)
+def _sim_gbm_forward_batch(mu, sigma, log_S0, n_days, n_branches):
+    results = np.empty(n_branches, dtype=np.float32)
+    total_steps = n_days * STEPS_PER_DAY
+    for b in range(n_branches):
+        log_S = log_S0
+        for i in range(total_steps):
+            log_S += (mu - 0.5 * sigma**2) * DT + sigma * np.sqrt(DT) * np.random.randn()
+        results[b] = log_S - log_S0
+    return results
+
+
+@njit(cache=True)
+def _sim_merton_forward_batch(mu, sigma, lam, mu_j, sigma_j, log_S0, n_days, n_branches):
+    results = np.empty(n_branches, dtype=np.float32)
+    total_steps = n_days * STEPS_PER_DAY
+    for b in range(n_branches):
+        log_S = log_S0
+        for i in range(total_steps):
+            log_S += (mu - 0.5 * sigma**2) * DT + sigma * np.sqrt(DT) * np.random.randn()
+            if np.random.rand() < lam * DT:
+                log_S += np.random.normal(mu_j, sigma_j)
+        results[b] = log_S - log_S0
+    return results
+
+
+@njit(cache=True)
+def _sim_kou_forward_batch(mu, sigma, lam, eta1, eta2, p, log_S0, n_days, n_branches):
+    results = np.empty(n_branches, dtype=np.float32)
+    total_steps = n_days * STEPS_PER_DAY
+    for b in range(n_branches):
+        log_S = log_S0
+        for i in range(total_steps):
+            log_S += (mu - 0.5 * sigma**2) * DT + sigma * np.sqrt(DT) * np.random.randn()
+            if np.random.rand() < lam * DT:
+                if np.random.rand() < p:
+                    log_S += np.random.exponential(1.0 / eta1)
+                else:
+                    log_S -= np.random.exponential(1.0 / eta2)
+        results[b] = log_S - log_S0
+    return results
+
+
+@njit(cache=True)
+def _sim_bates_forward_batch(mu, sigma, kappa, theta, xi, rho, lam, mu_j, sigma_j,
+                             log_S0, v0, n_days, n_branches):
+    results = np.empty(n_branches, dtype=np.float32)
+    total_steps = n_days * STEPS_PER_DAY
+    rho_complement = np.sqrt(1.0 - rho**2)
+    for b in range(n_branches):
+        log_S = log_S0
+        v = v0
+        for i in range(total_steps):
+            sqrt_v = np.sqrt(max(v, 0.0))
+            dW_s = np.sqrt(DT) * np.random.randn()
+            dW_v = rho * dW_s + rho_complement * np.sqrt(DT) * np.random.randn()
+            log_S += (mu - 0.5 * v) * DT + sqrt_v * dW_s
+            v += kappa * (theta - v) * DT + xi * sqrt_v * dW_v
+            v = max(v, 0.0)
+            if np.random.rand() < lam * DT:
+                log_S += np.random.normal(mu_j, sigma_j)
+        results[b] = log_S - log_S0
+    return results
+
+
+@njit(cache=True)
+def _sim_regime_switching_forward_batch(mus, sigmas, Q, n_regimes,
+                                        log_S0, regime0, n_days, n_branches):
+    results = np.empty(n_branches, dtype=np.float32)
+    total_steps = n_days * STEPS_PER_DAY
+    for b in range(n_branches):
+        log_S = log_S0
+        regime = regime0
+        for i in range(total_steps):
+            mu = mus[regime]
+            sigma_val = sigmas[regime]
+            log_S += (mu - 0.5 * sigma_val**2) * DT + sigma_val * np.sqrt(DT) * np.random.randn()
+            total_rate = -Q[regime, regime]
+            if total_rate > 0 and np.random.rand() < total_rate * DT:
+                u = np.random.rand() * total_rate
+                cumulative = 0.0
+                for j in range(n_regimes):
+                    if j == regime:
+                        continue
+                    cumulative += Q[regime, j]
+                    if u <= cumulative:
+                        regime = j
+                        break
+        results[b] = log_S - log_S0
+    return results
+
+
+# ── Context + branched futures dispatch ──────────────────────────────
+
+def simulate_context_and_branches(sde_type, params, context_days, horizon_days, n_branches):
+    """Simulate context path then branch N independent future paths.
+
+    This is the JointFM-style data generation: one history realization,
+    many future continuations from the same terminal state.
+
+    Parameters
+    ----------
+    sde_type : str
+        One of 'gbm', 'merton', 'kou', 'bates', 'regime_switching'.
+    params : dict
+        Parameter dict from sample_params.
+    context_days : int
+        Days of context (model input).
+    horizon_days : int
+        Days of forward simulation per branch.
+    n_branches : int
+        Number of independent future paths to branch.
+
+    Returns
+    -------
+    context_returns : np.ndarray, shape (context_days,)
+        Daily log-returns for the context window.
+    branches : np.ndarray, shape (n_branches,)
+        Cumulative log-return for each branched future path.
+    """
+    if sde_type == 'gbm':
+        ctx, log_S = _sim_gbm_with_state(params['mu'], params['sigma'], context_days)
+        branches = _sim_gbm_forward_batch(
+            params['mu'], params['sigma'], log_S, horizon_days, n_branches)
+
+    elif sde_type == 'merton':
+        ctx, log_S = _sim_merton_with_state(
+            params['mu'], params['sigma'],
+            params['lam'], params['mu_j'], params['sigma_j'], context_days)
+        branches = _sim_merton_forward_batch(
+            params['mu'], params['sigma'],
+            params['lam'], params['mu_j'], params['sigma_j'],
+            log_S, horizon_days, n_branches)
+
+    elif sde_type == 'kou':
+        ctx, log_S = _sim_kou_with_state(
+            params['mu'], params['sigma'],
+            params['lam'], params['eta1'], params['eta2'], params['p'], context_days)
+        branches = _sim_kou_forward_batch(
+            params['mu'], params['sigma'],
+            params['lam'], params['eta1'], params['eta2'], params['p'],
+            log_S, horizon_days, n_branches)
+
+    elif sde_type == 'bates':
+        ctx, log_S, v_term = _sim_bates_with_state(
+            params['mu'], params['sigma'],
+            params['kappa'], params['theta'], params['xi'], params['rho'],
+            params['lam'], params['mu_j'], params['sigma_j'], context_days)
+        branches = _sim_bates_forward_batch(
+            params['mu'], params['sigma'],
+            params['kappa'], params['theta'], params['xi'], params['rho'],
+            params['lam'], params['mu_j'], params['sigma_j'],
+            log_S, v_term, horizon_days, n_branches)
+
+    elif sde_type == 'regime_switching':
+        ctx, log_S, regime_term = _sim_regime_switching_with_state(
+            params['mus'], params['sigmas'],
+            params['Q'], params['n_regimes'], context_days)
+        branches = _sim_regime_switching_forward_batch(
+            params['mus'], params['sigmas'],
+            params['Q'], params['n_regimes'],
+            log_S, regime_term, horizon_days, n_branches)
+
+    else:
+        raise ValueError(f"Unknown SDE type: {sde_type}")
+
+    return ctx, branches
+
+
 # ── Parameter sampling ───────────────────────────────────────────────
 
 def sample_params(sde_type, rng=None):

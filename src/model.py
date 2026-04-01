@@ -1,19 +1,17 @@
 """
 Phantom: Transformer encoder for synthetic-pretrained BTC distributional prediction.
 
-Architecture informed by PatchTST, TimesFM, JointFM-0.1, and Chronos:
+Architecture informed by JointFM-0.1, PatchTST, and Chronos:
   - Encoder-only transformer with patched log-return input
-  - Mean absolute scaling (Chronos-style) — preserves shape, removes only magnitude
+  - NO normalization — raw log-returns preserve conditional signal (JointFM-style)
   - Learnable positional encoding
   - [CLS] token for sequence aggregation
   - Horizon conditioning via learned embedding
-  - Two head options: Mixture of Gaussians (MoG) or Quantile regression
+  - Mixture of Gaussians forecast head
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,55 +37,17 @@ class PhantomConfig:
     activation: str = "gelu"       # feedforward activation
 
     # --- Forecast head ---
-    head_type: str = "mog"         # "mog" or "quantile"
-    n_components: int = 5          # K in Mixture of Gaussians (mog only)
-    quantiles: list = field(default_factory=lambda: [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99])
+    n_components: int = 5          # K in Mixture of Gaussians
     horizons: list = field(default_factory=lambda: [3, 5, 7])
-    head_hidden: int = 256         # hidden dim in the MLP head
+    head_hidden: int = 256         # hidden dim in the MoG MLP head
 
-    # --- Numerical stability (mog only) ---
+    # --- Numerical stability ---
     log_sigma_min: float = -7.0    # floor for log-std (~e^-7 ≈ 0.0009)
-    log_sigma_max: float = 0.0     # ceiling for log-std (~e^0 = 1.0)
+    log_sigma_max: float = 2.0     # ceiling for log-std (~e^2 ≈ 7.4)
 
     @property
     def n_patches(self) -> int:
         return (self.context_len - self.patch_len) // self.patch_stride + 1
-
-
-# ── Mean Absolute Scaling (Chronos-style) ─────────────────────────
-
-class MeanAbsScaling(nn.Module):
-    """Per-sample scaling by mean absolute value.
-
-    Unlike RevIN, this preserves sign, trends, and distributional shape.
-    Only removes magnitude, so the transformer sees the actual pattern
-    of returns — not a standardized version.
-
-    Reference: Chronos (Amazon, 2024) uses this for probabilistic forecasting.
-    """
-
-    def __init__(self, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor):
-        """Scale input by mean absolute value.
-
-        Args:
-            x: (B, L) raw log-returns.
-        Returns:
-            x_scaled: (B, L) scaled.
-        """
-        self.scale = x.abs().mean(dim=-1, keepdim=True).clamp(min=self.eps)
-        return x / self.scale
-
-    def inverse_mog(self, mu: torch.Tensor, sigma: torch.Tensor):
-        """Denormalize MoG parameters back to original scale."""
-        return mu * self.scale, sigma * self.scale
-
-    def inverse_quantiles(self, q: torch.Tensor):
-        """Denormalize quantile predictions back to original scale."""
-        return q * self.scale
 
 
 # ── Patch Embedding ─────────────────────────────────────────────────
@@ -137,42 +97,26 @@ class MoGHead(nn.Module):
         return log_pi, mu, sigma
 
 
-# ── Quantile Head ──────────────────────────────────────────────────
-
-class QuantileHead(nn.Module):
-    """Predicts quantiles at fixed levels via pinball loss."""
-
-    def __init__(self, cfg: PhantomConfig):
-        super().__init__()
-        self.n_quantiles = len(cfg.quantiles)
-        self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.head_hidden),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.head_hidden, self.n_quantiles),
-        )
-
-    def forward(self, z: torch.Tensor):
-        return self.net(z)  # (B, n_quantiles)
-
-
 # ── Full Model ──────────────────────────────────────────────────────
 
 class PhantomModel(nn.Module):
     """Encoder-only transformer for distributional BTC prediction.
 
     Pipeline:
-        log-returns → MeanAbsScaling → Patch+Project → [CLS] + Pos Enc
+        raw log-returns → Patch+Project → [CLS] + Pos Enc
         → Transformer Encoder → CLS output + Horizon Embedding
-        → Head (MoG or Quantile) → output
+        → MoG Head → (π, μ, σ)
+
+    No normalization is applied — the model sees raw return patterns
+    and must learn to produce scale-appropriate distribution parameters.
+    This follows JointFM-0.1 which uses no normalization.
     """
 
     def __init__(self, cfg: PhantomConfig):
         super().__init__()
         self.cfg = cfg
 
-        # Input processing — mean absolute scaling (NOT RevIN)
-        self.scaler = MeanAbsScaling()
+        # Input processing — no normalization (JointFM-style)
         self.patch_embed = PatchEmbedding(cfg)
 
         # Learnable [CLS] token
@@ -203,10 +147,7 @@ class PhantomModel(nn.Module):
         )
 
         # Forecast head
-        if cfg.head_type == "quantile":
-            self.head = QuantileHead(cfg)
-        else:
-            self.head = MoGHead(cfg)
+        self.head = MoGHead(cfg)
 
         # Input dropout
         self.input_dropout = nn.Dropout(cfg.dropout)
@@ -225,44 +166,38 @@ class PhantomModel(nn.Module):
     def forward(self, x: torch.Tensor, horizon: torch.Tensor):
         """
         Args:
-            x:       (B, L) daily log-returns context window.
+            x:       (B, L) daily log-returns context window (raw, unnormalized).
             horizon: (B,)   forecast horizon in days (3, 5, or 7).
 
         Returns:
-            MoG mode:     (log_pi, mu, sigma) in original scale.
-            Quantile mode: quantile_preds (B, Q) in original scale.
+            log_pi: (B, K) log mixture weights.
+            mu:     (B, K) mixture means (raw log-return scale).
+            sigma:  (B, K) mixture stds (raw log-return scale).
         """
         B = x.size(0)
 
-        # 1. Scale (preserves shape — NOT RevIN)
-        x_scaled = self.scaler(x)
+        # 1. Patch embedding (no normalization — raw returns)
+        patches = self.patch_embed(x)
 
-        # 2. Patch embedding
-        patches = self.patch_embed(x_scaled)
-
-        # 3. Prepend [CLS] token
+        # 2. Prepend [CLS] token
         cls = self.cls_token.expand(B, -1, -1)
         tokens = torch.cat([cls, patches], dim=1)
 
-        # 4. Positional encoding + dropout
+        # 3. Positional encoding + dropout
         tokens = tokens + self.pos_enc
         tokens = self.input_dropout(tokens)
 
-        # 5. Transformer encoder
+        # 4. Transformer encoder
         z = self.encoder(tokens)
 
-        # 6. Extract [CLS]
+        # 5. Extract [CLS]
         cls_out = z[:, 0, :]
 
-        # 7. Horizon conditioning
+        # 6. Horizon conditioning
         h_emb = self.horizon_embed(horizon)
         cls_out = cls_out + h_emb
 
-        # 8. Head + denormalize
-        if self.cfg.head_type == "quantile":
-            q_norm = self.head(cls_out)
-            return self.scaler.inverse_quantiles(q_norm)
-        else:
-            log_pi, mu_norm, sigma_norm = self.head(cls_out)
-            mu, sigma = self.scaler.inverse_mog(mu_norm, sigma_norm)
-            return log_pi, mu, sigma
+        # 7. MoG head → distribution parameters (raw scale)
+        log_pi, mu, sigma = self.head(cls_out)
+
+        return log_pi, mu, sigma

@@ -28,11 +28,15 @@ def main():
         help="Output directory (default: data/)",
     )
     parser.add_argument(
+        "--n_branches", type=int, default=128,
+        help="Branched future paths per sample (default: 128)",
+    )
+    parser.add_argument(
         "--n_workers", type=int, default=None,
         help="Parallel workers (default: cpu_count, max 8)",
     )
     parser.add_argument(
-        "--chunk_size", type=int, default=5000,
+        "--chunk_size", type=int, default=1000,
         help="Samples per worker task (default: 5000)",
     )
     parser.add_argument(
@@ -47,6 +51,7 @@ def main():
         n_samples_per_shard=args.n_samples,
         output_dir=args.output_dir,
         context_len=args.context_len,
+        n_branches=args.n_branches,
         n_workers=args.n_workers,
         chunk_size=args.chunk_size,
         seed=args.seed,
