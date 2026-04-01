@@ -9,7 +9,7 @@
 #SBATCH --error=logs/datagen_%j.err
 
 # ─── Phantom: Generate 150M synthetic SDE trajectories ───────────────
-# 15 shards x 10M samples, context_len=75 (for Large model)
+# 150 shards x 1M samples, context_len=75 (for Large model)
 # CPU-only job — no GPU needed
 
 WORKDIR=/gpfs/workdir/dalbanal
@@ -25,8 +25,8 @@ apptainer exec --writable-tmpfs \
   --bind $WORKDIR/mytmp:/tmp \
   $WORKDIR/unsloth.sif \
   python generate.py \
-    --n_shards 15 \
-    --n_samples 10000000 \
+    --n_shards 150 \
+    --n_samples 1000000 \
     --context_len 75 \
     --n_workers 32 \
     --chunk_size 5000 \

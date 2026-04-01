@@ -13,6 +13,7 @@
 # ─── Phantom: Phase 1 pre-training — Large (75d, d=512, 8L) ─────────
 # 150M samples from shards, A100 GPU, 24h max
 # Saves only best.pt and latest.pt
+# Resumed from ~step 400K with corrected LR schedule (9 epochs)
 
 WORKDIR=/gpfs/workdir/dalbanal
 PROJECT=$WORKDIR/phantom
@@ -38,11 +39,12 @@ apptainer exec --nv --writable-tmpfs \
     --d_ff 2048 \
     --n_components 8 \
     --dropout 0.2 \
-    --epochs 30 \
+    --resume checkpoints/latest.pt \
+    --epochs 9 \
     --batch_size 512 \
     --lr 3e-4 \
     --min_lr 1e-6 \
-    --warmup_steps 2000 \
+    --warmup_steps 0 \
     --weight_decay 0.01 \
     --grad_clip 1.0 \
     --alpha 0.3 \

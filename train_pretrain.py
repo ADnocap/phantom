@@ -85,7 +85,8 @@ class Logger:
 # ── Validation ──────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(model, val_x, val_h, val_y, device, alpha, batch_size=512):
+def validate(model, val_x, val_h, val_y, device, alpha,
+             entropy_coeff=0.01, sharpness_coeff=0.1, batch_size=512):
     """Run validation on a fixed synthetic batch."""
     model.eval()
     n = val_x.size(0)
@@ -98,7 +99,9 @@ def validate(model, val_x, val_h, val_y, device, alpha, batch_size=512):
         y = val_y[i:i+batch_size].to(device)
 
         log_pi, mu, sigma = model(x, h)
-        loss, nll, crps = combined_loss(log_pi, mu, sigma, y, alpha=alpha)
+        loss, nll, crps = combined_loss(log_pi, mu, sigma, y, alpha=alpha,
+                                        entropy_coeff=entropy_coeff,
+                                        sharpness_coeff=sharpness_coeff)
 
         total_loss += loss.item()
         total_nll += nll.item()
@@ -170,7 +173,9 @@ def parse_args():
     p.add_argument('--warmup_steps', type=int, default=2000)
     p.add_argument('--weight_decay', type=float, default=0.01)
     p.add_argument('--grad_clip', type=float, default=1.0)
-    p.add_argument('--alpha', type=float, default=0.3, help='CRPS weight in combined loss')
+    p.add_argument('--alpha', type=float, default=2.0, help='CRPS weight in combined loss (>=1 for CRPS-dominant)')
+    p.add_argument('--entropy_coeff', type=float, default=0.01, help='Entropy regularization on mixture weights')
+    p.add_argument('--sharpness_coeff', type=float, default=0.1, help='Sharpness penalty on predicted variance')
     p.add_argument('--grad_accum', type=int, default=1, help='Gradient accumulation steps')
 
     # Mixed precision
@@ -348,7 +353,9 @@ def main():
             # ── Forward + loss ──
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 log_pi, mu, sigma = model(x, h)
-                loss, nll, crps = combined_loss(log_pi, mu, sigma, y, alpha=args.alpha)
+                loss, nll, crps = combined_loss(log_pi, mu, sigma, y, alpha=args.alpha,
+                                                entropy_coeff=args.entropy_coeff,
+                                                sharpness_coeff=args.sharpness_coeff)
                 loss = loss / args.grad_accum
 
             # ── Backward ──
@@ -402,7 +409,8 @@ def main():
 
             # ── Validation ──
             if global_step % args.val_every == 0:
-                val_metrics = validate(model, val_x, val_h, val_y, device, args.alpha)
+                val_metrics = validate(model, val_x, val_h, val_y, device, args.alpha,
+                                      args.entropy_coeff, args.sharpness_coeff)
                 logger.log(val_metrics, step=global_step)
 
                 if val_metrics['val_loss'] < best_val_loss:

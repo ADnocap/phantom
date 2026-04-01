@@ -133,28 +133,55 @@ def crps_loss(
     return crps.mean()
 
 
+def entropy_regularization(log_pi: torch.Tensor) -> torch.Tensor:
+    """Negative entropy of mixture weights — minimize to encourage uniform usage.
+
+    H = -Σ_k π_k log(π_k).  We return -H so that adding it to the loss
+    maximizes entropy (pushes weights toward uniform).
+    """
+    pi = log_pi.exp()
+    return (pi * log_pi).sum(dim=-1).mean()  # -H, averaged over batch
+
+
+def sharpness_penalty(
+    log_pi: torch.Tensor,
+    sigma: torch.Tensor,
+) -> torch.Tensor:
+    """Expected variance of the mixture — penalize overly broad predictions."""
+    pi = log_pi.exp()
+    return (pi * sigma ** 2).sum(dim=-1).mean()
+
+
 def combined_loss(
     log_pi: torch.Tensor,
     mu: torch.Tensor,
     sigma: torch.Tensor,
     target: torch.Tensor,
-    alpha: float = 0.3,
+    alpha: float = 2.0,
+    entropy_coeff: float = 0.01,
+    sharpness_coeff: float = 0.1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Combined training loss: NLL + α * CRPS.
+    """Combined training loss: NLL + α * CRPS + regularizers.
 
-    NLL drives sharp density estimation; CRPS regularizes calibration.
+    CRPS-dominant (α ≥ 1) rewards sharpness and avoids the "lazy marginal" trap.
+    Entropy reg prevents mixture component collapse.
+    Sharpness penalty discourages overly wide predictions.
 
     Args:
         log_pi: (B, K) log mixture weights.
         mu:     (B, K) component means.
         sigma:  (B, K) component stds.
         target: (B,)   observed cumulative log-return.
-        alpha:  weight for CRPS term (default 0.3).
+        alpha:  weight for CRPS term (default 2.0, CRPS-dominant).
+        entropy_coeff: weight for entropy regularization (default 0.01).
+        sharpness_coeff: weight for sharpness penalty (default 0.1).
 
     Returns:
         (total_loss, nll_term, crps_term) — all scalars.
     """
     nll = nll_loss(log_pi, mu, sigma, target)
     crps = crps_loss(log_pi, mu, sigma, target)
-    total = nll + alpha * crps
+    ent = entropy_regularization(log_pi)
+    sharp = sharpness_penalty(log_pi, sigma)
+    total = nll + alpha * crps + entropy_coeff * ent + sharpness_coeff * sharp
     return total, nll, crps

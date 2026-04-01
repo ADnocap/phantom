@@ -39,13 +39,13 @@ class PhantomConfig:
     activation: str = "gelu"       # feedforward activation
 
     # --- Forecast head ---
-    n_components: int = 8          # K in Mixture of Gaussians
+    n_components: int = 5          # K in Mixture of Gaussians
     horizons: list = field(default_factory=lambda: [3, 5, 7])
     head_hidden: int = 256         # hidden dim in the MoG MLP head
 
     # --- Numerical stability ---
     log_sigma_min: float = -7.0    # floor for log-std (~e^-7 ≈ 0.0009)
-    log_sigma_max: float = 2.0     # ceiling for log-std (~e^2 ≈ 7.4)
+    log_sigma_max: float = 0.0     # ceiling for log-std (~e^0 = 1.0)
 
     @property
     def n_patches(self) -> int:
@@ -193,6 +193,10 @@ class PhantomModel(nn.Module):
         # Horizon conditioning: one embedding per horizon value
         self.horizon_embed = nn.Embedding(max(cfg.horizons) + 1, cfg.d_model)
 
+        # Stat injection: project RevIN-removed (mean, std) back as features
+        # so the MoG head can condition on input level/scale
+        self.stat_proj = nn.Linear(2, cfg.d_model)
+
         # Transformer encoder (Pre-LN via norm_first=True)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=cfg.d_model,
@@ -266,12 +270,17 @@ class PhantomModel(nn.Module):
 
         # 7. Add horizon conditioning
         h_emb = self.horizon_embed(horizon)  # (B, d_model)
-        cls_out = cls_out + h_emb
 
-        # 8. MoG head → distribution parameters (normalized space)
+        # 8. Inject RevIN statistics so MoG head can condition on input level/scale
+        stats = torch.cat([self.revin.mean, self.revin.std], dim=-1)  # (B, 2)
+        stat_emb = self.stat_proj(stats)  # (B, d_model)
+
+        cls_out = cls_out + h_emb + stat_emb
+
+        # 9. MoG head → distribution parameters (normalized space)
         log_pi, mu_norm, sigma_norm = self.head(cls_out)
 
-        # 9. Denormalize to original log-return scale
+        # 10. Denormalize to original log-return scale
         mu, sigma = self.revin.inverse(mu_norm, sigma_norm)
 
         return log_pi, mu, sigma
