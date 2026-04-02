@@ -4,47 +4,54 @@ Synthetic pre-training for Bitcoin distributional prediction (3-7 day horizon), 
 
 ## Project Status
 
-Phase 1 (synthetic pre-training) implemented and iterating. Key finding: RevIN normalization causes the model to predict the marginal distribution — replaced with no-normalization (JointFM-style) and energy distance loss with branched futures.
+Phase 1 (synthetic pre-training) and Phase 2 (real BTC fine-tuning) complete. Model produces well-calibrated distributional forecasts (ECE=0.005, coverage within 1% of targets at all levels).
 
-## Tech Stack
+## Architecture
 
-- **Language**: Python
-- **Deep Learning**: PyTorch (`nn.TransformerEncoder`)
-- **SDE Simulation**: Custom Euler-Maruyama with Numba JIT
-- **Data**: Synthetic SDE trajectories (online generation with branched futures)
-- **Evaluation**: Energy distance, CRPS, PIT histogram, coverage
+- **Encoder**: 8-layer transformer (d=512, 8 heads) with patched input (5-day patches), no normalization
+- **Decoder**: 2-layer cross-attention decoder (horizon query attends to encoder patches)
+- **Head**: MoG (K=5 Gaussians) — outputs (π, μ, σ) per component
+- **Anti-collapse**: condition dropout (15%), SDE type classifier, volatility regressor
+- **Inference**: supports classifier-free guidance (forward_cfg) for sharper predictions
 
-## Architecture Overview
+## Training
 
-1. **Synthetic data generator** - samples SDE parameters from broad priors, simulates context trajectory, branches N=128 future paths from terminal state (JointFM-style)
-2. **Transformer encoder** (8 layers, d=512) with patched log-return input (context: 75 days), NO normalization
-3. **Mixture of Gaussians forecast head** (K=5 components) outputting distributional parameters for 3/5/7-day horizons
-4. **Energy distance loss** comparing MoG samples vs MC ground truth + auxiliary NLL
+- **Phase 1**: Energy distance loss on 128 branched MC futures per sample + auxiliary NLL + SDE classification + vol regression. Online generation, no pre-generated shards.
+- **Phase 2**: Mixed batches (70% synthetic ED + 30% real BTC CRPS). Gradual unfreezing with LLRD. L2-SP regularization. Real data: Bitstamp 2015 + Binance 2017-2026 via ccxt.
 
-## Key Design Decisions
+## Key Lessons
 
-- Work in **log-return space**, not raw prices
-- **No normalization** — raw log-returns preserve conditional signal (RevIN destroys it)
-- **Branched futures** — 128 MC paths per sample from shared terminal state, NOT 1 path per param set
-- **Energy distance** as primary loss (directly compares distributions), NLL as auxiliary (weight 0.1)
-- Horizon conditioning via learned embedding, not separate models
-- Asymmetric jump priors: downward jumps are larger/more frequent than upward
-- Online data generation (infinite stream, no pre-generated shards needed)
+- RevIN and MeanAbsScaling both destroy conditional signal — use NO normalization
+- Single-scalar targets + NLL = marginal prediction trap — use branched futures + energy distance
+- Auxiliary tasks (SDE classification + vol regression) force encoder to extract input-dependent features
+- Cross-attention decoder makes input-independent predictions architecturally impossible
+- Fine-tuning converges in ~500 steps; the pre-trained representations transfer well
 
-## Conventions
+## Project Structure
 
-- All SDE parameter priors should stay within the ranges specified in README.md Section 3
-- Evaluation must include: PIT histogram, CRPS vs baselines, coverage at 90%/95%, energy distance
-- Baselines to beat: historical simulation, GARCH(1,1) with Student-t, calibrated Kou jump-diffusion
+```
+src/              Core library (model, losses, SDE, data)
+scripts/train/    Training scripts (pretrain, finetune)
+scripts/eval/     Evaluation and visualization
+scripts/slurm/    HPC cluster job scripts
+plots/            All result plots (pretrain_*, finetune_*)
+logs/             Training metrics CSV
+```
 
 ## Running
 
 ```bash
 pip install -r requirements.txt
 
-# Train (online generation, recommended):
-python train_pretrain.py --data_mode online --samples_per_epoch 1000000 \
+# Pre-train
+python scripts/train/train_pretrain.py --data_mode online \
     --context_len 75 --d_model 512 --n_layers 8 --n_heads 8 --d_ff 2048 \
-    --n_branches 128 --n_model_samples 256 --nll_weight 0.1 \
-    --batch_size 256 --epochs 30
+    --n_branches 128 --n_decoder_layers 2 --cond_drop_prob 0.15 --aux_weight 0.5
+
+# Fine-tune on real BTC
+python scripts/train/train_finetune.py --pretrained checkpoints/best.pt
+
+# Evaluate
+python scripts/eval/eval_model.py
+python scripts/eval/visualize_btc.py --checkpoint checkpoints_ft/best.pt
 ```

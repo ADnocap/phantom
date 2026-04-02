@@ -1,369 +1,200 @@
-# Synthetic Pre-Training for Bitcoin Distributional Prediction (3–7 Day Horizon)
+# Phantom: Synthetic Pre-Training for Bitcoin Distributional Prediction
 
-_Adapting the methodology from [JointFM-0.1 (Hackmann, 2026)](https://arxiv.org/abs/2603.20266) — a foundation model pre-trained on synthetic SDE trajectories — to single-asset probabilistic forecasting of BTC/USD._
-
----
-
-## 0. Lessons Learned & Current Approach
-
-### The RevIN Problem (Resolved)
-
-Early versions used RevIN (Reversible Instance Normalization) from PatchTST. This produced **perfect calibration** (PIT histogram near-uniform, coverage within 1% of targets at all levels) but the model predicted the **marginal distribution regardless of input** — CRPS was 3x worse than a naive Gaussian baseline.
-
-**Root cause**: RevIN normalizes every input to mean=0, std=1, then denormalizes the output. For GBM paths, normalized returns are i.i.d. standard normal — the transformer sees identical distributions for every sample. The model learns a constant prediction in normalized space, and RevIN.inverse() provides correct scale/location "for free."
-
-**Finding**: JointFM (the paper this project is based on) uses **no normalization at all**. The model sees raw log-returns and must learn to produce scale-appropriate distribution parameters from the input context. We now follow this approach.
-
-### The Single-Scalar Target Problem (Resolved)
-
-The original implementation used a single future realization as the training target (Y = cumulative log-return). With NLL loss on a Mixture of Gaussians, predicting the marginal distribution is a stable local minimum — the gradient from one point is too weak to push toward conditional predictions.
-
-**Fix**: Following JointFM's data generation, we now **branch N=128 independent future paths** from each context's terminal state. The training target is the empirical conditional distribution (128 MC samples), not a single scalar. The primary loss is **energy distance** between MoG samples and the ground-truth MC samples, which directly rewards matching the conditional distribution.
-
-### Current Architecture
-
-- **No normalization** — raw log-returns as input (JointFM-style)
-- **MoG output head** (K=5 Gaussian components)
-- **Energy distance** as primary loss + auxiliary NLL (weight 0.1) for gradient flow to mixture weights
-- **Online data generation** — each training sample gets fresh SDE params + 128 branched futures
-- **Encoder-only transformer** with patched input (PatchTST-style)
+_Adapting the methodology from [JointFM-0.1 (Hackmann, 2026)](https://arxiv.org/abs/2603.20266) — a foundation model pre-trained on synthetic SDE trajectories — to single-asset probabilistic forecasting of BTC/USD over 3–7 day horizons._
 
 ---
 
-## 1. Core Idea
+## Results Summary
 
-JointFM shows that a transformer trained on **millions of synthetic stochastic trajectories** (sampled from SDEs with randomly varied parameters) can learn a general "grammar" of time-series dynamics and produce calibrated distributional forecasts at inference time — without ever fitting to the target data.
+**Pre-trained model** (90 epochs on synthetic SDE data):
+- Energy Distance: 0.0029 (MoG closely matches conditional branch distributions)
+- SDE Type Classification: 43.8% accuracy (2x random baseline)
+- Effective Components: 4.5/5 (near-full utilization of MoG)
+- NLL: -0.825
 
-We adapt this to a narrower, harder problem: predict the **full probability distribution** of Bitcoin's log-return (or price) over a 3–7 day forward window, given a context window of recent history.
-
-The key modifications from JointFM:
-
-- **Single-target** (univariate BTC), not multi-target joint distribution
-- **Crypto-specific SDE families** instead of generic/equity-focused samplers
-- **Short horizon** (3–7 days) instead of quarterly
-- **Mixed training**: synthetic majority + real BTC data minority
-
----
-
-## 2. Choosing the Right SDE Family
-
-Bitcoin returns exhibit heavy tails, volatility clustering, asymmetric jumps (crashes are sharper than rallies), and occasional regime shifts. No single SDE captures all of this, so we build a **mixture of generative models** and sample from them during training.
-
-### 2.1 Geometric Brownian Motion (Baseline)
-
-The simplest model. Useful as a "boring" component in the training mix so the network learns to recognize low-complexity dynamics too.
-
-$$
-dS_t = \mu \, S_t \, dt + \sigma \, S_t \, dW_t
-$$
-
-- $\mu$: drift
-- $\sigma$: constant volatility
-- $W_t$: standard Wiener process
-
-Log-returns over interval $\Delta t$:
-
-$$
-\ln\!\left(\frac{S_{t+\Delta t}}{S_t}\right) \sim \mathcal{N}\!\left(\left(\mu - \tfrac{\sigma^2}{2}\right)\Delta t,\; \sigma^2 \Delta t\right)
-$$
-
-### 2.2 Merton Jump-Diffusion
-
-Adds Poisson-driven jumps to GBM. Captures sudden crashes/pumps.
-
-$$
-dS_t = \mu \, S_t \, dt + \sigma \, S_t \, dW_t + S_{t^-}\, (e^{J} - 1)\, dN_t
-$$
-
-- $N_t$: Poisson process with intensity $\lambda$ (expected jumps per unit time)
-- $J \sim \mathcal{N}(\mu_J, \sigma_J^2)$: log-jump size
-
-### 2.3 Kou Double-Exponential Jump-Diffusion
-
-Like Merton but with **asymmetric double-exponential** jump sizes — a much better fit for crypto, where downward jumps tend to be larger and faster than upward ones.
-
-$$
-dS_t = \mu \, S_t \, dt + \sigma \, S_t \, dW_t + S_{t^-}\, (e^{J} - 1)\, dN_t
-$$
-
-where the jump size $J$ has density:
-
-$$
-f_J(x) = p \cdot \eta_1 \, e^{-\eta_1 x}\, \mathbf{1}_{x \geq 0} \;+\; (1-p) \cdot \eta_2 \, e^{\eta_2 x}\, \mathbf{1}_{x < 0}
-$$
-
-- $p$: probability of an upward jump
-- $\eta_1 > 1$: rate of upward jump decay (larger = smaller jumps)
-- $\eta_2 > 0$: rate of downward jump decay
-- Asymmetry: typically $p < 0.5$ and $\eta_2 < \eta_1$ for BTC (crashes are bigger)
-
-### 2.4 Bates Model (Stochastic Volatility + Jumps)
-
-Combines Heston stochastic volatility with Merton jumps. The most expressive single model.
-
-$$
-dS_t = \mu \, S_t \, dt + \sqrt{v_t} \, S_t \, dW_t^S + S_{t^-}(e^J - 1)\, dN_t
-$$
-
-$$
-dv_t = \kappa\,(\theta - v_t)\, dt + \xi \sqrt{v_t}\, dW_t^v
-$$
-
-$$
-\text{Corr}(dW_t^S, dW_t^v) = \rho
-$$
-
-- $v_t$: instantaneous variance (stochastic)
-- $\kappa$: mean-reversion speed of variance
-- $\theta$: long-run variance level
-- $\xi$: vol-of-vol
-- $\rho$: leverage effect (typically negative — vol rises when price drops)
-- $J, N_t$: same jump components as Merton
-
-### 2.5 Regime-Switching GBM
-
-Captures crypto's tendency to alternate between bull/bear/sideways regimes.
-
-$$
-dS_t = \mu_{Z_t}\, S_t\, dt + \sigma_{Z_t}\, S_t\, dW_t
-$$
-
-where $Z_t \in \{1, 2, \ldots, K\}$ is a continuous-time Markov chain with generator matrix $Q$.
-
-Each regime $k$ has its own $(\mu_k, \sigma_k)$. Transition rates $q_{ij}$ control how often the process switches. For BTC, 2–3 regimes work well (e.g., low-vol sideways, high-vol bull, crash).
-
-### 2.6 (Optional) CGMY / Tempered Stable
-
-For even heavier tails than jump-diffusion, replace the Brownian component with a tempered stable (CGMY) process. This is more exotic and harder to simulate, but captures the empirical observation that BTC returns have near-infinite variance in some periods.
+**Fine-tuned model** (on real BTC data, 2015–2026 via Bitstamp + Binance):
+- ECE: 0.005 (near-perfect calibration)
+- Coverage: 52%/81%/90%/95% at 50/80/90/95% target levels
+- CRPS: 0.029 on real BTC test set (2023-07 to 2026)
+- PIT histogram approximately uniform
 
 ---
 
-## 3. Parameter Sampling Strategy
-
-The central insight from JointFM: **don't fit one set of parameters — sample many plausible ones and train the model to handle all of them.**
-
-For each training batch, we:
-
-1. **Sample an SDE type** from {GBM, Merton, Kou, Bates, Regime-Switching} with weights (e.g., 5%, 20%, 30%, 30%, 15%)
-2. **Sample parameters** from broad priors calibrated to be "BTC-plausible"
-3. **Simulate a trajectory** of length `context_window + forecast_horizon`
-4. **Train** the model to predict the distributional forecast given the context
-
-### Recommended Parameter Priors
-
-These ranges are informed by historical BTC calibrations but deliberately broadened so the model generalizes:
-
-| Parameter                   | Symbol     | Prior Distribution                               | Rationale                                         |
-| --------------------------- | ---------- | ------------------------------------------------ | ------------------------------------------------- |
-| **Annualized drift**        | $\mu$      | $\text{Uniform}(-0.5, 1.5)$                      | BTC has ranged from severe bear to 10x bull years |
-| **Base volatility**         | $\sigma$   | $\text{Uniform}(0.3, 1.5)$                       | BTC annualized vol typically 40–120%, allow wider |
-| **Jump intensity**          | $\lambda$  | $\text{Uniform}(0.5, 50)$ /yr                    | From rare (1/yr) to frequent (weekly) jumps       |
-| **Jump mean (up)**          | $1/\eta_1$ | $\text{Uniform}(0.01, 0.15)$                     | Avg upward jump 1–15%                             |
-| **Jump mean (down)**        | $1/\eta_2$ | $\text{Uniform}(0.02, 0.25)$                     | Avg downward jump 2–25% (asymmetric)              |
-| **Up-jump probability**     | $p$        | $\text{Beta}(2, 3)$                              | Centered ~0.4, slight downward bias               |
-| **Mean-reversion speed**    | $\kappa$   | $\text{Uniform}(0.5, 10)$                        | Vol mean-reverts over days to months              |
-| **Long-run variance**       | $\theta$   | $\text{Uniform}(0.1, 2.0)$                       | Squared, so covers wide vol range                 |
-| **Vol-of-vol**              | $\xi$      | $\text{Uniform}(0.2, 2.0)$                       | BTC vol itself is volatile                        |
-| **Leverage correlation**    | $\rho$     | $\text{Uniform}(-0.9, -0.1)$                     | Negative: vol rises on drops                      |
-| **Regime transition rates** | $q_{ij}$   | $\text{Exponential}(\text{mean}=30\text{ days})$ | Avg regime duration ~1 month                      |
-
-### Simulation Details
-
-- **Time step**: $\Delta t = 1/365$ (daily) or $1/(365 \times 24)$ (hourly) for finer resolution
-- **Context window**: 30–90 days of history (the model sees this)
-- **Forecast horizon**: 3, 5, or 7 days (randomly chosen per sample during training)
-- **Paths per parameter set**: 1 (the diversity comes from parameter variation, not repeated paths)
-- **Transform**: work in **log-return space** $r_t = \ln(S_t / S_{t-1})$, not raw prices
-
----
-
-## 4. Model Architecture
-
-Following JointFM's approach but simplified for the univariate case:
+## Architecture
 
 ```
-Input: [r_{t-L}, r_{t-L+1}, ..., r_{t-1}, r_t]  (context window of L log-returns)
+Input: 75 daily log-returns (raw, no normalization)
   │
   ▼
-Patching & Embedding (group returns into patches of ~5 days)
+Patch Embedding (5-day patches → d_model=512)
   │
   ▼
-Transformer Encoder (6–8 layers, causal or bidirectional over context)
+Transformer Encoder (8 layers, 8 heads, Pre-LN)
+  │                          ┌─ SDE Type Classifier (5-way)
+  ├── Auxiliary Heads ───────┤
+  │                          └─ Volatility Regressor
+  ▼
+Cross-Attention Decoder (horizon query attends to all encoder patches)
   │
   ▼
-Forecast Head: outputs distributional parameters for horizon h ∈ {3,5,7} days
-  │
-  ▼
-Output: parameters of predicted distribution for cumulative log-return r_{t+1:t+h}
+MoG Head → K=5 Gaussian components (π, μ, σ)
 ```
 
-### 4.1 Output Distribution (Forecast Head)
+### Key Design Choices
 
-The forecast head parameterizes a **flexible distribution** over the cumulative h-day log-return. Good choices:
+Three mechanisms prevent the "predict the marginal" collapse:
 
-**Option A — Mixture of Gaussians:**
+1. **Cross-attention decoder**: horizon query attends to ALL encoder patches — input-independent predictions are architecturally impossible
+2. **Auxiliary tasks**: SDE type classifier + volatility regressor force the encoder to extract input-dependent features
+3. **Condition dropout** (15%): enables classifier-free guidance at inference — amplifies conditional signal
 
-$$
-p(r_{t:t+h}) = \sum_{k=1}^{K} \pi_k \; \mathcal{N}(r \mid \mu_k, \sigma_k^2)
-$$
-
-The head outputs $3K$ values: $K$ mixture weights (softmax), $K$ means, $K$ log-standard-deviations. Use $K = 5$–$10$ components.
-
-**Option B — Quantile regression (non-parametric):**
-
-Output $Q$ quantile predictions $\hat{q}_{\tau_1}, \ldots, \hat{q}_{\tau_Q}$ at fixed probability levels (e.g., $\tau \in \{0.01, 0.05, 0.10, \ldots, 0.90, 0.95, 0.99\}$).
-
-**Option C — Normalizing flow head:**
-
-A small conditional normalizing flow (e.g., 4-layer affine coupling) that maps a base Gaussian to the target distribution. Most expressive, but more complex to train.
-
-**Recommendation**: Start with Mixture of Gaussians ($K=8$). It's expressive enough for heavy tails and multimodality, easy to sample from, and has a closed-form likelihood for the loss function.
-
-### 4.2 Horizon Conditioning
-
-Encode the forecast horizon $h$ (3, 5, or 7 days) as a learned embedding and add/concatenate it to the transformer's output before the forecast head. This lets one model handle all horizons.
+Additional:
+- **No normalization** — raw log-returns preserve conditional signal (RevIN destroys it; see lessons learned below)
+- **JointFM-style branched futures**: 128 MC paths per sample from shared terminal state
+- **Energy distance** as primary loss + auxiliary NLL (weight 0.1)
 
 ---
 
-## 5. Loss Function
+## SDE Families
 
-### 5.1 Primary: Negative Log-Likelihood (NLL)
+Five SDE families for synthetic data generation, sampled with weights [5%, 15%, 30%, 30%, 20%]:
 
-For Mixture of Gaussians with $K$ components:
+| Family | Key Feature | Parameters |
+|--------|------------|------------|
+| **GBM** | Baseline (constant vol) | μ, σ |
+| **Merton Jump-Diffusion** | Poisson jumps (symmetric) | μ, σ, λ, μ_j, σ_j |
+| **Kou Double-Exponential** | Asymmetric jumps (crashes > rallies) | μ, σ, λ, η₁, η₂, p |
+| **Bates** | Stochastic vol + jumps (most expressive) | μ, σ, κ, θ, ξ, ρ, λ, μ_j, σ_j |
+| **Regime-Switching GBM** | Bull/bear/sideways regimes | μₖ, σₖ, Q matrix |
 
-$$
-\mathcal{L}_{\text{NLL}} = -\ln \sum_{k=1}^{K} \pi_k \; \phi\!\left(\frac{r^* - \mu_k}{\sigma_k}\right) \frac{1}{\sigma_k}
-$$
-
-where $r^* = \ln(S_{t+h}/S_t)$ is the realized cumulative log-return and $\phi$ is the standard normal PDF.
-
-For quantile regression, use the **pinball loss**:
-
-$$
-\mathcal{L}_{\text{pinball}} = \sum_{i=1}^{Q} \rho_{\tau_i}(r^* - \hat{q}_{\tau_i}), \quad \rho_\tau(u) = u\,(\tau - \mathbf{1}_{u<0})
-$$
-
-### 5.2 Auxiliary: CRPS (Continuous Ranked Probability Score)
-
-CRPS directly measures how well the predicted CDF matches reality. For a mixture of Gaussians it has a closed form. It's a strictly proper scoring rule — the true distribution uniquely minimizes it.
-
-$$
-\text{CRPS}(F, r^*) = \mathbb{E}_F[|X - r^*|] - \tfrac{1}{2}\mathbb{E}_F[|X - X'|]
-$$
-
-where $X, X' \sim F$ are independent draws from the predicted distribution.
-
-### 5.3 Combined Training Loss
-
-$$
-\mathcal{L} = \mathcal{L}_{\text{NLL}} + \alpha \cdot \text{CRPS}
-$$
-
-with $\alpha \approx 0.1$–$0.5$. The NLL drives sharp density estimation; CRPS regularizes calibration.
+Parameters are sampled from broad BTC-plausible priors (see `src/sde.py:sample_params`). Simulation runs at hourly resolution (dt = 1/(365×24)) and returns daily log-returns.
 
 ---
 
-## 6. Mixing in Real Data
+## Training Pipeline
 
-Pure synthetic training risks a domain gap. We propose a **curriculum with real data fine-tuning**:
+### Phase 1: Synthetic Pre-Training
 
-### Phase 1: Synthetic Pre-training (80% of training)
+Each training step:
+1. Sample random SDE type and parameters from priors
+2. Simulate 75-day context path at hourly resolution
+3. Branch 128 independent future paths from the terminal state (3/5/7 day horizons)
+4. Train with energy distance (MoG samples vs MC branches) + auxiliary NLL + SDE classification + vol regression
 
-Train on purely synthetic trajectories as described above. This teaches the model the geometry of stochastic processes.
+Online generation (infinite data, no pre-generated shards needed). 90 total epochs across two runs (30 epochs at LR=3e-4, then 60 epochs at LR=1e-4).
 
-### Phase 2: Mixed Fine-tuning (20% of training)
+### Phase 2: Fine-Tuning on Real BTC
 
-Mix synthetic and real data:
+Mixed batches: 70% synthetic (energy distance) + 30% real BTC (CRPS loss).
 
-- **70% synthetic** (same as phase 1)
-- **30% real BTC data** — historical daily/hourly returns from 2015–present
+Real data: Bitstamp (2015-2017) + Binance (2017-2026), stitched via ccxt. 4,110 daily observations yielding 7,425 training / 1,617 validation / 3,000 test samples (rolling windows × 3 horizons).
 
-For real data augmentation:
-
-- **Rolling windows**: slide the context window across all available history
-- **Multi-exchange**: use data from Bitstamp, Coinbase, Binance for slight distributional variety
-- **Bootstrap**: resample contiguous blocks to increase effective dataset size
-
-### Why Not 100% Real Data?
-
-BTC has ~3,800 daily observations (2015–2025). For a 60-day context + 7-day horizon, that's only ~3,700 non-overlapping-ish training examples. Far too few to train a transformer. The synthetic data provides the volume; the real data provides the fine-tuning signal.
+Gradual unfreezing: head+decoder only for 2K steps, then full model with layer-wise LR decay (0.7x per layer). L2-SP regularization toward pre-trained weights prevents catastrophic forgetting.
 
 ---
 
-## 7. Evaluation
+## Loss Functions
 
-### 7.1 Calibration (PIT Histogram)
+| Phase | Primary Loss | Auxiliary | Target |
+|-------|-------------|-----------|--------|
+| Pre-training | Energy Distance (MoG vs 128 MC branches) | NLL (0.1×) + SDE classifier + vol regressor | Conditional distribution |
+| Fine-tuning (synthetic) | Energy Distance | NLL (0.1×) | Conditional distribution |
+| Fine-tuning (real) | Closed-form CRPS | NLL (0.05×) | Single realization |
 
-Apply the **Probability Integral Transform**: if the model is well-calibrated, $F(r^*) \sim \text{Uniform}(0,1)$. Plot the histogram of PIT values across the test set — it should be flat.
-
-### 7.2 CRPS on Held-Out Real Data
-
-Compute CRPS on a rolling out-of-sample window (e.g., 2023–2025 real BTC data). Compare against baselines:
-
-- Historical simulation (empirical distribution of past 60-day windows)
-- GARCH(1,1) with Student-t innovations
-- Calibrated Kou jump-diffusion (classical, fitted daily)
-
-### 7.3 Coverage
-
-Check prediction interval coverage:
-
-$$
-\text{Coverage}(\alpha) = \frac{1}{N}\sum_{i=1}^{N} \mathbf{1}\!\left[r_i^* \in \left[q_{\alpha/2}^{(i)},\; q_{1-\alpha/2}^{(i)}\right]\right]
-$$
-
-A well-calibrated model should have ~90% coverage at the 90% level, ~95% at 95%, etc.
-
-### 7.4 Tail Accuracy
-
-Specifically check the 1st and 99th percentile predictions. For BTC risk management, the tails matter more than the center. Report the **tail-weighted CRPS** (weight extreme quantiles more heavily).
-
-### 7.5 Sharpness
-
-Calibration alone isn't enough — a model predicting "uniform over all possible returns" would be perfectly calibrated but useless. Also report the average **width of the 90% prediction interval**. Narrower is better, conditional on maintaining calibration.
-
-### Key Libraries
-
-- **SDE simulation**: `sdeint`, `diffrax` (JAX), or custom Euler-Maruyama
-- **Transformer**: PyTorch with standard `nn.TransformerEncoder`
-- **Data**: `yfinance` or `ccxt` for real BTC data
-- **Evaluation**: `properscoring` (CRPS), `scipy.stats` (PIT)
+Energy distance: ED(P,Q) = 2E[|X-Y|] - E[|X-X'|] - E[|Y-Y'|], computed via reparameterized MoG samples and sorted-array trick for O(N log N) pairwise terms.
 
 ---
 
-## 8. Risks & Mitigations
+## Lessons Learned
 
-| Risk                                  | Severity | Mitigation                                                               |
-| ------------------------------------- | -------- | ------------------------------------------------------------------------ |
-| Synthetic-real distribution gap       | High     | Mixed fine-tuning (Phase 2); validate PIT on real data                   |
-| SDE family too narrow                 | Medium   | Include 5+ SDE types; add CGMY if tails are still underweight            |
-| Overfitting to real data in Phase 2   | Medium   | Keep synthetic majority (70%); early stopping on real validation set     |
-| Model learns "average SDE" not BTC    | Medium   | Weight Kou + Bates higher in sampling; condition on recent realized vol  |
-| 3-day vs 7-day horizon conflict       | Low      | Horizon embedding; or train separate lightweight heads                   |
-| Non-stationarity of BTC dynamics      | High     | Use rolling retraining (e.g., quarterly); expand SDE priors over time    |
-| Evaluation on too-small real test set | Medium   | Use expanding-window backtest over 2+ years; report confidence intervals |
+### RevIN Destroys Conditional Signal
+
+Early versions used RevIN (Reversible Instance Normalization) from PatchTST. This produced perfect calibration but the model predicted the **marginal distribution regardless of input** — CRPS was 3x worse than a naive Gaussian baseline.
+
+**Root cause**: RevIN normalizes every input to mean=0, std=1. For GBM paths, normalized returns are i.i.d. standard normal — the transformer sees identical distributions for every sample. RevIN.inverse() then provides correct scale/location "for free." JointFM uses **no normalization at all**.
+
+### Single-Scalar Targets + NLL = Marginal Trap
+
+Training on one future realization per context with NLL loss makes predicting the marginal a stable local minimum. The gradient from one point is too weak to push toward conditional predictions. JointFM solves this by branching thousands of future paths as the training target.
+
+### MeanAbsScaling Doesn't Help Either
+
+Replacing RevIN with Chronos-style mean absolute scaling (divide by mean |returns|) still allows the model to predict a constant in normalized space, with the scaler providing the rescaling. The issue is ANY normalization + denormalization shortcut, not specifically RevIN.
+
+### Auxiliary Tasks Break the Collapse
+
+The encoder can produce constant representations because energy distance (averaged over diverse training data) approximately accepts the marginal as a minimum. Auxiliary tasks (SDE type classification, volatility regression) create direct gradient signal that forces the encoder to produce input-dependent features — a constant vector cannot correctly classify 5 SDE types.
+
+### Condition Dropout Amplifies Signal
+
+Randomly zeroing the encoder output during training (15% probability) teaches the model what its predictions look like WITHOUT context. At inference, classifier-free guidance extrapolates: `output = unconditional + scale × (conditional - unconditional)`, amplifying the conditional signal ~2x.
 
 ---
 
-## 9. Why This Should Work (and Where It Might Not)
+## Project Structure
 
-**Why it should work:**
+```
+phantom/
+├── src/                          # Core library
+│   ├── model.py                  # PhantomModel (encoder + cross-attn decoder + MoG head)
+│   ├── losses.py                 # Energy distance, NLL, CRPS
+│   ├── sde.py                    # 5 SDE simulators (Numba JIT) + branched future generation
+│   ├── data.py                   # OnlineDataset, ShardDataset, make_validation_batch
+│   ├── generator.py              # Parallel shard generation
+│   └── btc_data.py               # Real BTC data fetching (ccxt: Bitstamp + Binance)
+├── scripts/
+│   ├── train/
+│   │   ├── train_pretrain.py     # Phase 1: synthetic pre-training
+│   │   └── train_finetune.py     # Phase 2: mixed fine-tuning on real BTC
+│   ├── eval/
+│   │   ├── eval_model.py         # Full 9-panel evaluation (PIT, coverage, CRPS, etc.)
+│   │   └── visualize_btc.py      # BTC price paths with prediction fans + calibration
+│   └── slurm/                    # HPC cluster job scripts (LaRuche A100)
+├── plots/                        # All evaluation and training curve plots
+│   ├── pretrain_*.png            # Pre-training phase results
+│   └── finetune_*.png            # Fine-tuning phase results
+├── logs/                         # Training metrics (CSV)
+│   ├── pretrain/
+│   └── finetune/
+├── generate.py                   # CLI for synthetic data generation
+├── requirements.txt
+└── CLAUDE.md
+```
 
-The JointFM paper demonstrates that transformers can learn a surprisingly general mapping from "recent trajectory shape" → "plausible future distribution" when exposed to enough variety during training. By narrowing the SDE family to crypto-plausible dynamics and adding real BTC fine-tuning, we get the best of both worlds: the model sees enough stochastic variety to generalize, but is also grounded in real market data.
+## Running
 
-**Where it might fail:**
+```bash
+pip install -r requirements.txt
 
-Bitcoin is driven partly by **exogenous, non-price signals** — regulatory news, exchange hacks, ETF flows, macro events, social media sentiment — that leave no trace in the price history alone. A purely price-based distributional model will produce well-calibrated intervals _on average_, but will be poorly calibrated _conditional on_ major news events. It will likely underestimate tail probabilities during calm periods (when a shock is brewing but hasn't hit yet) and overestimate them during already-volatile periods.
+# Phase 1: Synthetic pre-training (online generation)
+python scripts/train/train_pretrain.py \
+    --data_mode online --samples_per_epoch 1000000 \
+    --context_len 75 --d_model 512 --n_layers 8 --n_heads 8 --d_ff 2048 \
+    --n_branches 128 --n_model_samples 256 --nll_weight 0.1 --aux_weight 0.5 \
+    --cond_drop_prob 0.15 --n_decoder_layers 2 \
+    --batch_size 256 --epochs 30 --lr 3e-4
 
-To partially address this, you could extend the context to include auxiliary features (on-chain metrics, funding rates, options implied vol, VIX) — but this moves away from the clean synthetic pre-training paradigm and into more traditional feature engineering territory.
+# Phase 2: Fine-tune on real BTC
+python scripts/train/train_finetune.py \
+    --pretrained checkpoints/best.pt \
+    --real_fraction 0.3 --steps 10000 \
+    --lr_head 1e-4 --lr_encoder 3e-5 --freeze_encoder_steps 2000
+
+# Evaluate
+python scripts/eval/eval_model.py --checkpoint checkpoints/best.pt
+python scripts/eval/visualize_btc.py --checkpoint checkpoints_ft/best.pt
+```
 
 ---
 
 ## References
 
 - **JointFM-0.1**: Hackmann, S. (2026). _JointFM-0.1: A Foundation Model for Multi-Target Joint Distributional Prediction._ [arXiv:2603.20266](https://arxiv.org/abs/2603.20266)
-- **Kou Jump-Diffusion**: Kou, S. G. (2002). _A Jump-Diffusion Model for Option Pricing._ Management Science, 48(8), 1086–1101.
-- **Bates Model**: Bates, D. S. (1996). _Jumps and Stochastic Volatility: Exchange Rate Processes Implicit in Deutsche Mark Options._ Review of Financial Studies, 9(1), 69–107.
-- **CRPS**: Gneiting, T. & Raftery, A. E. (2007). _Strictly Proper Scoring Rules, Prediction, and Estimation._ JASA, 102(477), 359–378.
-- **Time-Series Foundation Models**: Das et al. (2024). _A Decoder-Only Foundation Model for Time-Series Forecasting._ [arXiv:2310.10688](https://arxiv.org/abs/2310.10688)
-- **Crypto Volatility Modeling**: Scaillet, O., Treccani, A., & Trevisan, C. (2020). _High-Frequency Jump Analysis of the Bitcoin Market._ Journal of Financial Econometrics, 18(2), 209–232.
+- **PatchTST**: Nie, Y. et al. (2023). _A Time Series is Worth 64 Words._ ICLR 2023.
+- **Chronos**: Ansari, A.F. et al. (2024). _Chronos: Learning the Language of Time Series._ [arXiv:2403.07815](https://arxiv.org/abs/2403.07815)
+- **Moirai 2.0**: Liu, S. et al. (2025). _When Less Is More for Time Series Forecasting._ [arXiv:2511.11698](https://arxiv.org/abs/2511.11698)
+- **RevIN**: Kim, T. et al. (2022). _Reversible Instance Normalization for Accurate Time-Series Forecasting._ ICLR 2022.
+- **Kou Jump-Diffusion**: Kou, S. G. (2002). _A Jump-Diffusion Model for Option Pricing._ Management Science, 48(8).
+- **Bates Model**: Bates, D. S. (1996). _Jumps and Stochastic Volatility._ Review of Financial Studies, 9(1).
+- **CRPS**: Gneiting, T. & Raftery, A. E. (2007). _Strictly Proper Scoring Rules, Prediction, and Estimation._ JASA, 102(477).
+- **Energy Distance**: Szekely, G. J. & Rizzo, M. L. (2013). _Energy statistics._ Journal of Statistical Planning and Inference, 143(8).
