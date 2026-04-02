@@ -27,7 +27,7 @@ apptainer exec --nv --writable-tmpfs \
   --bind $WORKDIR:$WORKDIR:rw \
   --bind $WORKDIR/mytmp:/tmp \
   $WORKDIR/unsloth.sif \
-  python train_finetune.py \
+  python scripts/train/train_finetune.py \
     --pretrained checkpoints/best.pt \
     --btc_cache data/btc_daily.npz \
     --val_start 2022-01-01 \

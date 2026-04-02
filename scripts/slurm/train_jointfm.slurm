@@ -27,7 +27,7 @@ apptainer exec --nv --writable-tmpfs \
   --bind $WORKDIR:$WORKDIR:rw \
   --bind $WORKDIR/mytmp:/tmp \
   $WORKDIR/unsloth.sif \
-  python train_pretrain.py \
+  python scripts/train/train_pretrain.py \
     --data_mode online \
     --samples_per_epoch 1000000 \
     --n_branches 128 \

@@ -85,7 +85,9 @@ class MixedBatchSampler:
             self.synthetic, batch_size=1, num_workers=0, drop_last=True)
         # Flatten: DataLoader wraps each sample in an extra dim
         def flatten_iter():
-            for x, h, yb in loader:
+            for batch in loader:
+                # OnlineDataset yields (x, h, yb, sde_idx, rv) — only need first 3
+                x, h, yb = batch[0], batch[1], batch[2]
                 yield x.squeeze(0), h.squeeze(0), yb.squeeze(0)
         self._synth_iter = flatten_iter()
 
@@ -208,7 +210,7 @@ def parse_args():
     p.add_argument('--val_every', type=int, default=500)
     p.add_argument('--save_every', type=int, default=1000)
     p.add_argument('--checkpoint_dir', type=str, default='checkpoints_ft/')
-    p.add_argument('--log_dir', type=str, default='logs_ft/')
+    p.add_argument('--log_dir', type=str, default='logs/finetune/')
 
     # Misc
     p.add_argument('--seed', type=int, default=42)
@@ -241,6 +243,8 @@ def main():
     ckpt = torch.load(args.pretrained, map_location='cpu', weights_only=False)
     cfg = PhantomConfig(**{k: v for k, v in ckpt['config'].items()
                           if k in PhantomConfig.__dataclass_fields__})
+    # Disable condition dropout during fine-tuning (real data is scarce)
+    cfg.cond_drop_prob = 0.0
     model = PhantomModel(cfg).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
     pretrained_state = {k: v.clone().to(device) for k, v in model.state_dict().items()}
@@ -280,9 +284,19 @@ def main():
     # ── Optimizer with layer-wise LR decay ──
     param_groups = []
 
-    # Head + horizon embed: highest LR
-    head_params = list(model.head.parameters()) + list(model.horizon_embed.parameters())
-    param_groups.append({'params': head_params, 'lr': args.lr_head, 'name': 'head'})
+    # Head + decoder + horizon embed + aux heads: highest LR
+    head_params = (list(model.head.parameters()) +
+                   list(model.horizon_embed.parameters()) +
+                   list(model.decoder_layers.parameters()) +
+                   list(model.decoder_norm.parameters()))
+    # Include aux heads if they exist
+    if hasattr(model, 'sde_classifier'):
+        head_params += list(model.sde_classifier.parameters())
+    if hasattr(model, 'vol_regressor'):
+        head_params += list(model.vol_regressor.parameters())
+    if hasattr(model, 'aux_pool'):
+        head_params += list(model.aux_pool.parameters())
+    param_groups.append({'params': head_params, 'lr': args.lr_head, 'name': 'head+decoder'})
 
     # Encoder layers: decaying LR from top to bottom
     n_layers = cfg.n_layers
@@ -298,8 +312,7 @@ def main():
 
     # Patch embed + positional: lowest LR
     embed_lr = args.lr_encoder * (args.llrd ** n_layers)
-    embed_params = (list(model.patch_embed.parameters()) +
-                    [model.cls_token, model.pos_enc])
+    embed_params = list(model.patch_embed.parameters()) + [model.pos_enc]
     if hasattr(model.encoder, 'norm') and model.encoder.norm is not None:
         embed_params += list(model.encoder.norm.parameters())
     param_groups.append({'params': embed_params, 'lr': embed_lr, 'name': 'embeddings'})
@@ -339,10 +352,11 @@ def main():
     running_count = 0
     t_start = time.time()
 
-    # Initially freeze encoder
+    # Initially freeze encoder (keep head, decoder, horizon, aux unfrozen)
     encoder_frozen = True
+    unfrozen_keys = ['head', 'horizon', 'decoder', 'sde_classifier', 'vol_regressor', 'aux_pool']
     for name, param in model.named_parameters():
-        if 'head' not in name and 'horizon' not in name:
+        if not any(k in name for k in unfrozen_keys):
             param.requires_grad = False
     print(f"\n{'='*60}")
     print(f"Phase 2a: head-only for {args.freeze_encoder_steps} steps")
@@ -362,7 +376,8 @@ def main():
         frac = get_lr(step, args.warmup_steps, args.steps, 1.0, args.min_lr / args.lr_head)
         for pg in param_groups:
             base_lr = pg.get('lr', args.lr_head)
-            pg['lr'] = base_lr * frac if not encoder_frozen or 'head' in pg['name'] else 0.0
+            is_head = 'head' in pg['name'] or 'decoder' in pg['name']
+            pg['lr'] = base_lr * frac if not encoder_frozen or is_head else 0.0
 
         # Get mixed batch
         real_x, real_h, real_y, synth_x, synth_h, synth_yb = mixer.get_batch(0, step, device)

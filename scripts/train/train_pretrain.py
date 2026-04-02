@@ -167,7 +167,7 @@ def parse_args():
     p.add_argument('--val_every', type=int, default=2000)
     p.add_argument('--save_every', type=int, default=5000)
     p.add_argument('--checkpoint_dir', type=str, default='checkpoints/')
-    p.add_argument('--log_dir', type=str, default='logs/')
+    p.add_argument('--log_dir', type=str, default='logs/pretrain/')
     p.add_argument('--resume', type=str, default=None)
     p.add_argument('--val_samples', type=int, default=2048)
     p.add_argument('--seed', type=int, default=42)

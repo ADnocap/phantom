@@ -205,7 +205,7 @@ def main():
         f"Phantom JointFM Eval -- best.pt (step {ckpt['step']:,}, ED={ed.item():.4f}, CRPS={crps_model:.4f})",
         fontsize=15, y=0.99,
     )
-    plt.savefig('model_eval.png', dpi=150, bbox_inches='tight')
+    plt.savefig('plots/pretrain_eval.png', dpi=150, bbox_inches='tight')
     print("\nSaved model_eval.png")
 
 
