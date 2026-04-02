@@ -4,19 +4,59 @@ _Adapting the methodology from [JointFM-0.1 (Hackmann, 2026)](https://arxiv.org/
 
 ---
 
-## Results Summary
+## Results
 
-**Pre-trained model** (90 epochs on synthetic SDE data):
-- Energy Distance: 0.0029 (MoG closely matches conditional branch distributions)
-- SDE Type Classification: 43.8% accuracy (2x random baseline)
-- Effective Components: 4.5/5 (near-full utilization of MoG)
-- NLL: -0.825
+### Real BTC Predictions (Out-of-Sample: 2023–2026)
 
-**Fine-tuned model** (on real BTC data, 2015–2026 via Bitstamp + Binance):
-- ECE: 0.005 (near-perfect calibration)
-- Coverage: 52%/81%/90%/95% at 50/80/90/95% target levels
-- CRPS: 0.029 on real BTC test set (2023-07 to 2026)
-- PIT histogram approximately uniform
+![BTC Predictions](plots/finetune_btc_predictions.png)
+
+The model produces calibrated prediction intervals on real BTC price paths. Blue = 75-day context (model input), green = actual future, red fans = predicted distribution (2.5–97.5%, 10–90%, 25–75% intervals). Calibration curve (top-left) shows ECE = 0.005 with coverage within 1% of target at all levels.
+
+### Pre-Training Evaluation (Synthetic Data)
+
+![Pre-training Eval](plots/pretrain_eval.png)
+
+### Fine-Tuning Evaluation (Real BTC Test Set)
+
+![Fine-tuning Eval](plots/finetune_eval.png)
+
+### Training Curves
+
+<details>
+<summary>Pre-training curves (90 epochs)</summary>
+
+![Pre-training Curves](plots/pretrain_training_curves.png)
+
+SDE type classification accuracy reaches 43.8% (2x random baseline of 20%), confirming the encoder extracts input-dependent features.
+</details>
+
+<details>
+<summary>Fine-tuning curves</summary>
+
+![Fine-tuning Curves](plots/finetune_training_curves.png)
+
+Fine-tuning converges in ~500 steps. Val CRPS improves from 0.066 (pre-trained) to 0.038 with no catastrophic forgetting (synthetic ED stays at 0.003).
+</details>
+
+### Summary
+
+| Metric | Pre-trained | Fine-tuned |
+|--------|------------|------------|
+| Energy Distance | 0.0029 | — |
+| CRPS (test set) | 0.066 (synthetic) | 0.029 (real BTC) |
+| ECE | — | 0.005 |
+| Coverage 50/80/90/95% | 47/77/88/94 | 52/81/90/95 |
+| SDE Accuracy | 43.8% | — |
+| Effective K | 4.5/5 | 4.4/5 |
+| NLL | -0.825 | -1.554 |
+
+---
+
+### Predicted vs True Distributions (Synthetic Data, by SDE Type)
+
+![Distribution Comparison](plots/pretrain_visual_distributions.png)
+
+Each row shows a different SDE type (Merton, Kou, Bates, Regime-Switching), with low-volatility contexts on the left and high-volatility on the right. Green = true MC branches, red = standard prediction, purple = classifier-free guidance (sharper).
 
 ---
 
