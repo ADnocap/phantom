@@ -124,14 +124,23 @@ def make_rolling_windows(
     log_returns: np.ndarray,
     context_len: int = 75,
     horizons: list = [3, 5, 7],
+    n_input_channels: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create rolling window samples from real log-return series.
 
+    Args:
+        log_returns: Full log-return series.
+        context_len: Number of days per context window.
+        horizons: List of forecast horizons.
+        n_input_channels: 1 = returns only, 4 = returns + 3 vol features.
+
     Returns:
-        X: (N, context_len) float32 — context windows
+        X: (N, context_len) or (N, context_len, C) float32 — context windows
         H: (N,) int8 — horizons
         Y: (N,) float32 — cumulative forward log-returns
     """
+    from .data import compute_vol_features
+
     X_list, H_list, Y_list = [], [], []
     max_h = max(horizons)
     n = len(log_returns)
@@ -140,7 +149,12 @@ def make_rolling_windows(
         ctx = log_returns[start:start + context_len]
         for h in horizons:
             fwd = log_returns[start + context_len:start + context_len + h].sum()
-            X_list.append(ctx)
+            if n_input_channels > 1:
+                vol_feats = compute_vol_features(ctx)  # (L, 3)
+                x = np.concatenate([ctx.astype(np.float32).reshape(-1, 1), vol_feats], axis=1)
+                X_list.append(x)
+            else:
+                X_list.append(ctx)
             H_list.append(h)
             Y_list.append(fwd)
 
@@ -148,7 +162,7 @@ def make_rolling_windows(
     H = np.array(H_list, dtype=np.int8)
     Y = np.array(Y_list, dtype=np.float32)
 
-    print(f"Rolling windows: {len(X)} samples (context={context_len}, horizons={horizons})")
+    print(f"Rolling windows: {len(X)} samples (context={context_len}, horizons={horizons}, channels={n_input_channels})")
     return X, H, Y
 
 
@@ -159,17 +173,15 @@ def temporal_split(
     horizons: list = [3, 5, 7],
     val_start: str = "2022-01-01",
     test_start: str = "2023-07-01",
+    n_input_channels: int = 1,
 ) -> dict:
     """Split real data into train/val/test by date.
 
     Returns dict with 'train', 'val', 'test' keys, each containing (X, H, Y).
     """
-    # Find split indices in the dates array
     val_idx = np.searchsorted(dates, val_start)
     test_idx = np.searchsorted(dates, test_start)
 
-    # We need context_len dates BEFORE the split point for the first window
-    # The log_returns array is 1 shorter than dates
     splits = {}
     for name, start, end in [
         ('train', 0, val_idx - 1),
@@ -177,7 +189,8 @@ def temporal_split(
         ('test', test_idx - context_len, len(log_returns)),
     ]:
         lr_slice = log_returns[max(start, 0):end]
-        X, H, Y = make_rolling_windows(lr_slice, context_len, horizons)
+        X, H, Y = make_rolling_windows(lr_slice, context_len, horizons,
+                                        n_input_channels=n_input_channels)
         splits[name] = (X, H, Y)
         print(f"  {name}: {len(X)} samples")
 

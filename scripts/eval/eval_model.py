@@ -6,30 +6,43 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from scipy.stats import norm as scipy_norm
+from scipy.stats import norm as scipy_norm, t as scipy_t
 
 from src.model import PhantomConfig, PhantomModel
 from src.data import make_validation_batch
 from src.losses import energy_distance_loss, nll_loss, crps_loss
 
 
-def mog_cdf(y, pi, mu, sigma):
+def mixture_cdf_np(y, pi, mu, sigma, nu=None):
+    """CDF of a mixture distribution (Gaussian or Student-t) at point y."""
+    if nu is not None:
+        return np.sum(pi * scipy_t.cdf(y, df=nu, loc=mu, scale=sigma))
     return np.sum(pi * scipy_norm.cdf(y, loc=mu, scale=sigma))
 
 
-def mog_quantile(p, pi, mu, sigma, lo=-5, hi=5):
+def mixture_quantile_np(p, pi, mu, sigma, nu=None, lo=-5, hi=5):
+    """Quantile of a mixture distribution via bisection."""
     for _ in range(60):
         mid = (lo + hi) / 2
-        if np.sum(pi * scipy_norm.cdf(mid, loc=mu, scale=sigma)) < p:
+        if mixture_cdf_np(mid, pi, mu, sigma, nu) < p:
             lo = mid
         else:
             hi = mid
     return (lo + hi) / 2
 
 
-def sample_mog(pi, mu, sigma, n=5000):
+def sample_mixture_np(pi, mu, sigma, nu=None, n=5000):
+    """Sample from a mixture distribution."""
     components = np.random.choice(len(pi), size=n, p=pi)
+    if nu is not None:
+        return scipy_t.rvs(df=nu[components], loc=mu[components], scale=sigma[components])
     return np.random.normal(mu[components], sigma[components])
+
+
+# Backward-compatible aliases
+mog_cdf = mixture_cdf_np
+mog_quantile = mixture_quantile_np
+sample_mog = sample_mixture_np
 
 
 def main():
@@ -44,9 +57,12 @@ def main():
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} params, K={cfg.n_components}")
 
     # ── Generate test data with branches ──
+    n_channels = getattr(cfg, 'n_input_channels', 1)
+    sde_ver = 'v2' if getattr(cfg, 'n_sde_types', 5) > 5 else 'v1'
     print("Generating test set (8192 samples, 128 branches)...")
     test_x, test_h, test_yb, _, _ = make_validation_batch(
-        n_samples=8192, context_len=cfg.context_len, n_branches=128, seed=7777)
+        n_samples=8192, context_len=cfg.context_len, n_branches=128, seed=7777,
+        n_input_channels=n_channels, sde_version=sde_ver)
 
     # Use a random branch per sample as the "true" scalar y (for CRPS/PIT/coverage)
     rng = np.random.default_rng(42)
@@ -54,29 +70,36 @@ def main():
     test_y = test_yb[torch.arange(len(test_yb)), y_idx]
 
     # ── Get predictions ──
+    use_student_t = getattr(cfg, 'use_student_t', False)
     with torch.no_grad():
-        log_pi, mu, sigma = model(test_x, test_h)
+        log_pi, mu, sigma, nu = model(test_x, test_h)
 
     pi = torch.exp(log_pi)
     pi_np, mu_np, sigma_np = pi.numpy(), mu.numpy(), sigma.numpy()
+    nu_np = nu.numpy() if nu is not None else None
     y_np, h_np = test_y.numpy(), test_h.numpy()
     yb_np = test_yb.numpy()
 
     print(f"Pi range: [{pi_np.min():.4f}, {pi_np.max():.4f}]")
     print(f"Mu range: [{mu_np.min():.4f}, {mu_np.max():.4f}]")
     print(f"Sigma range: [{sigma_np.min():.4f}, {sigma_np.max():.4f}]")
+    if nu_np is not None:
+        print(f"Nu range: [{nu_np.min():.2f}, {nu_np.max():.2f}]")
 
     # ── Losses ──
     with torch.no_grad():
-        ed = energy_distance_loss(log_pi, mu, sigma, test_yb, n_model_samples=256)
-        nll = nll_loss(log_pi, mu, sigma, test_y)
-        crps = crps_loss(log_pi, mu, sigma, test_y)
+        ed = energy_distance_loss(log_pi, mu, sigma, test_yb, n_model_samples=256, nu=nu)
+        nll = nll_loss(log_pi, mu, sigma, test_y, nu=nu)
+        crps = crps_loss(log_pi, mu, sigma, test_y, nu=nu)
     print(f"Energy Distance: {ed.item():.4f}")
     print(f"NLL: {nll.item():.4f}")
     print(f"CRPS: {crps.item():.4f}")
 
     # ── PIT values ──
-    pit_values = np.array([mog_cdf(y_np[i], pi_np[i], mu_np[i], sigma_np[i]) for i in range(len(y_np))])
+    def _get_nu_i(i):
+        return nu_np[i] if nu_np is not None else None
+    pit_values = np.array([mixture_cdf_np(y_np[i], pi_np[i], mu_np[i], sigma_np[i], _get_nu_i(i))
+                           for i in range(len(y_np))])
 
     # ── Coverage ──
     coverages = {}
@@ -84,8 +107,9 @@ def main():
         alpha = (1 - level) / 2
         inside = 0
         for i in range(len(y_np)):
-            lo = mog_quantile(alpha, pi_np[i], mu_np[i], sigma_np[i])
-            hi = mog_quantile(1 - alpha, pi_np[i], mu_np[i], sigma_np[i])
+            nu_i = _get_nu_i(i)
+            lo = mixture_quantile_np(alpha, pi_np[i], mu_np[i], sigma_np[i], nu_i)
+            hi = mixture_quantile_np(1 - alpha, pi_np[i], mu_np[i], sigma_np[i], nu_i)
             if lo <= y_np[i] <= hi:
                 inside += 1
         cov = inside / len(y_np)
@@ -147,7 +171,8 @@ def main():
 
     # 3. CRPS comparison
     ax = fig.add_subplot(gs[0, 2])
-    methods = ['Model\n(MoG K=5)', 'Marginal\nGaussian', 'Per-horizon\nGaussian']
+    head_label = 'MoT' if use_student_t else 'MoG'
+    methods = [f'Model\n({head_label} K={cfg.n_components})', 'Marginal\nGaussian', 'Per-horizon\nGaussian']
     crps_vals = [crps_model, crps_gaussian, crps_per_horizon]
     colors = ['tab:blue', 'tab:gray', 'tab:gray']
     bars = ax.bar(methods, crps_vals, color=colors, alpha=0.8, edgecolor='white')
@@ -165,7 +190,7 @@ def main():
         mask = (h_np == h_val)
         sample_idxs = np.where(mask)[0][:6]
         for i, si in enumerate(sample_idxs):
-            samples = sample_mog(pi_np[si], mu_np[si], sigma_np[si], n=3000)
+            samples = sample_mixture_np(pi_np[si], mu_np[si], sigma_np[si], _get_nu_i(si), n=3000)
             color = f'C{i}'
             ax.hist(samples, bins=60, density=True, alpha=0.3, color=color)
             ax.axvline(y_np[si], color=color, linewidth=2, linestyle='-')

@@ -5,8 +5,23 @@ Synthetic pre-training for Phantom with three anti-collapse mechanisms:
   2. Condition dropout (classifier-free guidance training)
   3. Cross-attention decoder (architectural conditioning)
 
+v2 additions:
+  4. Student-t mixture head (--use_student_t)
+  5. Gumbel-Softmax energy distance (--use_gumbel_softmax)
+  6. Auxiliary quantile loss (--quantile_weight)
+  7. Multi-scale patching (--patch_sizes)
+  8. Multi-channel input features (--n_input_channels)
+  9. Series decomposition (--use_decomposition)
+  10. New SDE families (--sde_version v2)
+
 Usage:
+  # v1 (original):
   python train_pretrain.py --data_mode online --samples_per_epoch 1000000
+
+  # v2 (all improvements):
+  python train_pretrain.py --data_mode online --use_student_t --use_gumbel_softmax \\
+    --quantile_weight 0.2 --use_decomposition --patch_sizes 3 5 15 \\
+    --n_input_channels 4 --sde_version v2 --context_len 75
 """
 
 import argparse
@@ -64,11 +79,12 @@ class Logger:
 
 @torch.no_grad()
 def validate(model, val_x, val_h, val_yb, val_sde, val_rv, device,
-             n_model_samples=256, nll_weight=0.1, batch_size=512):
+             n_model_samples=256, nll_weight=0.1, batch_size=512,
+             use_gumbel_softmax=False, quantile_weight=0.0):
+    from src.losses import crps_loss, quantile_loss
     model.eval()
     n = val_x.size(0)
-    total_loss, total_ed, total_nll = 0.0, 0.0, 0.0
-    total_sde_acc, total_vol_mse = 0.0, 0.0
+    accum = {}
     n_batches = 0
 
     for i in range(0, n, batch_size):
@@ -78,31 +94,56 @@ def validate(model, val_x, val_h, val_yb, val_sde, val_rv, device,
         sde = val_sde[i:i+batch_size].to(device)
         rv = val_rv[i:i+batch_size].to(device)
 
-        log_pi, mu, sigma = model(x, h)
+        log_pi, mu, sigma, nu = model(x, h)
         loss, ed, nll = combined_loss(log_pi, mu, sigma, yb,
                                       n_model_samples=n_model_samples,
-                                      nll_weight=nll_weight)
+                                      nll_weight=nll_weight,
+                                      nu=nu,
+                                      use_gumbel_softmax=use_gumbel_softmax,
+                                      quantile_weight=quantile_weight)
 
-        # Auxiliary metrics
+        # Pick a random branch as scalar target for CRPS
+        B, N = yb.shape
+        rand_idx = torch.randint(N, (B,), device=yb.device)
+        y_single = yb[torch.arange(B, device=yb.device), rand_idx]
+        crps_val = crps_loss(log_pi, mu, sigma, y_single, nu=nu)
+
+        # Auxiliary
         sde_logits, vol_pred = model.forward_auxiliary(x)
         sde_acc = (sde_logits.argmax(dim=-1) == sde).float().mean()
         vol_mse = F.mse_loss(vol_pred, rv)
 
-        total_loss += loss.item()
-        total_ed += ed.item()
-        total_nll += nll.item()
-        total_sde_acc += sde_acc.item()
-        total_vol_mse += vol_mse.item()
+        # Head stats
+        pi = log_pi.exp()
+        eff_k = torch.exp(-torch.sum(pi * log_pi, dim=-1)).mean()  # effective components
+        mean_mu = mu.abs().mean()
+        mean_sigma = sigma.mean()
+
+        # Per-horizon ED
+        for h_val in [3, 5, 7]:
+            mask = (h == h_val)
+            if mask.any():
+                h_key = f'val_ed_h{h_val}'
+                from src.losses import energy_distance_loss
+                h_ed = energy_distance_loss(log_pi[mask], mu[mask], sigma[mask],
+                                            yb[mask], n_model_samples, nu=nu[mask] if nu is not None else None)
+                accum[h_key] = accum.get(h_key, 0.0) + h_ed.item()
+
+        # Accumulate
+        for k, v in [('val_loss', loss), ('val_ed', ed), ('val_nll', nll),
+                      ('val_crps', crps_val), ('val_sde_acc', sde_acc),
+                      ('val_vol_mse', vol_mse), ('val_eff_k', eff_k),
+                      ('val_mean_mu', mean_mu), ('val_mean_sigma', mean_sigma)]:
+            accum[k] = accum.get(k, 0.0) + (v.item() if torch.is_tensor(v) else v)
+
+        if nu is not None:
+            mean_nu = nu.mean()
+            accum['val_mean_nu'] = accum.get('val_mean_nu', 0.0) + mean_nu.item()
+
         n_batches += 1
 
     model.train()
-    return {
-        'val_loss': total_loss / n_batches,
-        'val_ed': total_ed / n_batches,
-        'val_nll': total_nll / n_batches,
-        'val_sde_acc': total_sde_acc / n_batches,
-        'val_vol_mse': total_vol_mse / n_batches,
-    }
+    return {k: v / n_batches for k, v in accum.items()}
 
 
 def save_checkpoint(path, model, optimizer, scaler, step, epoch, config, best_val_loss):
@@ -173,6 +214,24 @@ def parse_args():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', type=str, default=None)
 
+    # ── v2 flags ──
+    p.add_argument('--use_student_t', action='store_true', default=False,
+                   help='Use Student-t mixture head instead of Gaussian')
+    p.add_argument('--use_gumbel_softmax', action='store_true', default=False,
+                   help='Use Gumbel-Softmax for differentiable energy distance')
+    p.add_argument('--quantile_weight', type=float, default=0.0,
+                   help='Weight for auxiliary quantile loss (0 = disabled)')
+    p.add_argument('--patch_sizes', type=int, nargs='+', default=None,
+                   help='Multi-scale patch sizes (e.g. 3 5 15). None = single-scale')
+    p.add_argument('--n_input_channels', type=int, default=1,
+                   help='Input channels (1=returns, 4=returns+3 vol features)')
+    p.add_argument('--use_decomposition', action='store_true', default=False,
+                   help='Use in-model series decomposition')
+    p.add_argument('--decomp_kernel', type=int, default=5,
+                   help='Kernel size for decomposition moving average')
+    p.add_argument('--sde_version', type=str, default='v1', choices=['v1', 'v2'],
+                   help='SDE family version (v2 adds MRW + Fractional OU)')
+
     return p.parse_args()
 
 
@@ -190,6 +249,9 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    # Determine n_sde_types from sde_version
+    n_sde_types = 7 if args.sde_version == 'v2' else 5
+
     cfg = PhantomConfig(
         context_len=args.context_len, patch_len=args.patch_len,
         patch_stride=args.patch_stride, d_model=args.d_model,
@@ -197,17 +259,40 @@ def main():
         dropout=args.dropout, n_components=args.n_components,
         n_decoder_layers=args.n_decoder_layers,
         cond_drop_prob=args.cond_drop_prob,
+        n_sde_types=n_sde_types,
+        # v2
+        use_student_t=args.use_student_t,
+        patch_sizes=args.patch_sizes,
+        n_input_channels=args.n_input_channels,
+        use_decomposition=args.use_decomposition,
+        decomp_kernel=args.decomp_kernel,
     )
 
     model = PhantomModel(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {n_params:,} params | patches={cfg.n_patches} | K={cfg.n_components}")
     print(f"Decoder layers: {cfg.n_decoder_layers} | Cond drop: {cfg.cond_drop_prob}")
+    if args.use_student_t:
+        print("Head: Mixture of Student-t")
+    if args.patch_sizes:
+        print(f"Multi-scale patches: {args.patch_sizes}")
+    if args.n_input_channels > 1:
+        print(f"Input channels: {args.n_input_channels}")
+    if args.use_decomposition:
+        print(f"Series decomposition: kernel={args.decomp_kernel}")
+    if args.use_gumbel_softmax:
+        print("Energy distance: Gumbel-Softmax (differentiable)")
+    if args.quantile_weight > 0:
+        print(f"Quantile loss weight: {args.quantile_weight}")
+    if args.sde_version == 'v2':
+        print("SDE families: v2 (+ MRW, Fractional OU)")
 
     # Data
     dataset = OnlineDataset(
         context_len=cfg.context_len, n_branches=args.n_branches,
         samples_per_epoch=args.samples_per_epoch, seed=args.seed,
+        n_input_channels=args.n_input_channels,
+        sde_version=args.sde_version,
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, num_workers=args.n_workers,
@@ -249,6 +334,8 @@ def main():
     val_x, val_h, val_yb, val_sde, val_rv = make_validation_batch(
         n_samples=args.val_samples, context_len=cfg.context_len,
         n_branches=args.n_branches, seed=args.seed + 1234,
+        n_input_channels=args.n_input_channels,
+        sde_version=args.sde_version,
     )
 
     logger = Logger(Path(args.log_dir))
@@ -259,7 +346,18 @@ def main():
 
     model.train()
     global_step = start_step
-    run_loss, run_ed, run_nll, run_sde_acc, run_vol = 0., 0., 0., 0., 0.
+    # Running accumulators for detailed logging
+    run = {
+        'loss': 0., 'loss_main': 0., 'loss_aux': 0.,
+        'ed': 0., 'nll': 0., 'loss_sde': 0., 'vol_mse': 0.,
+        'sde_acc': 0.,
+        'mean_mu': 0., 'mean_sigma': 0., 'eff_k': 0.,
+        'grad_norm': 0.,
+    }
+    if args.use_student_t:
+        run['mean_nu'] = 0.
+    if args.quantile_weight > 0:
+        run['quantile_loss'] = 0.
     run_count = 0
     t_start = time.time()
 
@@ -281,12 +379,15 @@ def main():
             rv_labels = rv_labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                # Main loss: energy distance + aux NLL
-                log_pi, mu, sigma = model(x, h)
+                # Main loss: energy distance + aux NLL (+ optional quantile)
+                log_pi, mu, sigma, nu = model(x, h)
                 loss_main, ed, nll = combined_loss(
                     log_pi, mu, sigma, yb,
                     n_model_samples=args.n_model_samples,
                     nll_weight=args.nll_weight,
+                    nu=nu,
+                    use_gumbel_softmax=args.use_gumbel_softmax,
+                    quantile_weight=args.quantile_weight,
                 )
 
                 # Auxiliary losses: SDE classification + vol regression
@@ -306,21 +407,36 @@ def main():
             if (batch_idx + 1) % args.grad_accum == 0:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
                     optimizer.step()
                 optimizer.zero_grad()
+            else:
+                grad_norm = 0.0
 
-            # Track
+            # ── Track detailed metrics ──
+            with torch.no_grad():
+                pi = log_pi.exp()
+                eff_k = torch.exp(-torch.sum(pi * log_pi, dim=-1)).mean().item()
+
             sde_acc = (sde_logits.detach().argmax(-1) == sde_labels).float().mean().item()
-            run_loss += loss.item() * args.grad_accum
-            run_ed += ed.item()
-            run_nll += nll.item()
-            run_sde_acc += sde_acc
-            run_vol += loss_vol.item()
+            run['loss'] += loss.item() * args.grad_accum
+            run['loss_main'] += loss_main.item()
+            run['loss_aux'] += loss_aux.item()
+            run['ed'] += ed.item()
+            run['nll'] += nll.item()
+            run['loss_sde'] += loss_sde.item()
+            run['vol_mse'] += loss_vol.item()
+            run['sde_acc'] += sde_acc
+            run['mean_mu'] += mu.detach().abs().mean().item()
+            run['mean_sigma'] += sigma.detach().mean().item()
+            run['eff_k'] += eff_k
+            run['grad_norm'] += grad_norm
+            if args.use_student_t and nu is not None:
+                run['mean_nu'] += nu.detach().mean().item()
             run_count += 1
             global_step += 1
 
@@ -329,20 +445,35 @@ def main():
                 sps = global_step / elapsed if elapsed > 0 else 0
                 eta = (total_steps - global_step) / sps if sps > 0 else 0
 
-                logger.log({
+                metrics = {
                     'epoch': epoch, 'lr': lr,
-                    'loss': run_loss / run_count,
-                    'ed': run_ed / run_count,
-                    'nll': run_nll / run_count,
-                    'sde_acc': run_sde_acc / run_count,
-                    'vol_mse': run_vol / run_count,
+                    'loss': run['loss'] / run_count,
+                    'loss_main': run['loss_main'] / run_count,
+                    'loss_aux': run['loss_aux'] / run_count,
+                    'ed': run['ed'] / run_count,
+                    'nll': run['nll'] / run_count,
+                    'loss_sde': run['loss_sde'] / run_count,
+                    'vol_mse': run['vol_mse'] / run_count,
+                    'sde_acc': run['sde_acc'] / run_count,
+                    'mean_mu': run['mean_mu'] / run_count,
+                    'mean_sigma': run['mean_sigma'] / run_count,
+                    'eff_k': run['eff_k'] / run_count,
+                    'grad_norm': run['grad_norm'] / run_count,
                     'steps/s': sps, 'eta_min': eta / 60,
-                }, step=global_step)
-                run_loss, run_ed, run_nll, run_sde_acc, run_vol, run_count = 0, 0, 0, 0, 0, 0
+                }
+                if args.use_student_t and 'mean_nu' in run:
+                    metrics['mean_nu'] = run['mean_nu'] / run_count
+                logger.log(metrics, step=global_step)
+                # Reset accumulators
+                for k in run:
+                    run[k] = 0.
+                run_count = 0
 
             if global_step % args.val_every == 0:
                 val_m = validate(model, val_x, val_h, val_yb, val_sde, val_rv,
-                                 device, args.n_model_samples, args.nll_weight)
+                                 device, args.n_model_samples, args.nll_weight,
+                                 use_gumbel_softmax=args.use_gumbel_softmax,
+                                 quantile_weight=args.quantile_weight)
                 logger.log(val_m, step=global_step)
                 if val_m['val_loss'] < best_val_loss:
                     best_val_loss = val_m['val_loss']

@@ -7,7 +7,13 @@ Architecture:
   - Cross-attention decoder (horizon query attends to all encoder patches)
   - Condition dropout for classifier-free guidance
   - Auxiliary heads (SDE type classification + volatility regression)
-  - Mixture of Gaussians forecast head
+  - Mixture forecast head (Gaussian or Student-t components)
+
+v2 additions:
+  - Student-t mixture head (use_student_t)
+  - Multi-scale patching (patch_sizes)
+  - Multi-channel input features (n_input_channels)
+  - In-model series decomposition (use_decomposition)
 """
 
 from dataclasses import dataclass, field
@@ -43,34 +49,130 @@ class PhantomConfig:
     n_decoder_layers: int = 2
 
     # Auxiliary tasks
-    n_sde_types: int = 5           # GBM, Merton, Kou, Bates, Regime-Switching
+    n_sde_types: int = 5           # GBM, Merton, Kou, Bates, Regime-Switching (v1)
 
     # Condition dropout (classifier-free guidance)
     cond_drop_prob: float = 0.15   # probability of zeroing encoder output during training
 
+    # ── v2 additions ──
+
+    # Student-t mixture head
+    use_student_t: bool = False
+    log_nu_min: float = 0.7        # log(2.01) — nu > 2 for finite variance
+    log_nu_max: float = 4.6        # log(100)
+
+    # Multi-scale patching (None = single-scale original)
+    patch_sizes: list | None = None
+
+    # Multi-channel input (1 = raw returns only, 4 = returns + 3 vol features)
+    n_input_channels: int = 1
+
+    # In-model series decomposition (Autoformer-style)
+    use_decomposition: bool = False
+    decomp_kernel: int = 5
+
     @property
     def n_patches(self) -> int:
+        if self.patch_sizes is not None:
+            return sum((self.context_len - ps) // ps + 1 for ps in self.patch_sizes)
         return (self.context_len - self.patch_len) // self.patch_stride + 1
 
 
 # ── Patch Embedding ─────────────────────────────────────────────────
 
 class PatchEmbedding(nn.Module):
+    """Single-scale patch embedding with optional multi-channel support."""
+
     def __init__(self, cfg: PhantomConfig):
         super().__init__()
         self.patch_len = cfg.patch_len
         self.patch_stride = cfg.patch_stride
-        self.proj = nn.Linear(cfg.patch_len, cfg.d_model)
+        self.n_channels = cfg.n_input_channels
+        in_dim = cfg.patch_len * cfg.n_input_channels
+        self.proj = nn.Linear(in_dim, cfg.d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        patches = x.unfold(dimension=-1, size=self.patch_len, step=self.patch_stride)
-        return self.proj(patches)
+        if x.dim() == 3:
+            # (B, L, C) multi-channel input
+            p = x.unfold(1, self.patch_len, self.patch_stride)  # (B, N, C, ps)
+            B, N, C, ps = p.shape
+            p = p.reshape(B, N, C * ps)  # (B, N, C*ps)
+        else:
+            # (B, L) single-channel (backward compat)
+            p = x.unfold(dimension=-1, size=self.patch_len, step=self.patch_stride)
+        return self.proj(p)
+
+
+class MultiScalePatchEmbedding(nn.Module):
+    """Multi-resolution patch embedding with per-scale learned embeddings."""
+
+    def __init__(self, cfg: PhantomConfig):
+        super().__init__()
+        self.patch_sizes = cfg.patch_sizes
+        self.n_channels = cfg.n_input_channels
+        self.projections = nn.ModuleList()
+        self.scale_embeddings = nn.ParameterList()
+        self.patches_per_scale = []
+
+        for ps in cfg.patch_sizes:
+            n_patches = (cfg.context_len - ps) // ps + 1
+            self.patches_per_scale.append(n_patches)
+            in_dim = ps * cfg.n_input_channels
+            self.projections.append(nn.Linear(in_dim, cfg.d_model))
+            self.scale_embeddings.append(
+                nn.Parameter(torch.empty(1, n_patches, cfg.d_model)))
+
+        self._init_embeddings()
+
+    def _init_embeddings(self):
+        for emb in self.scale_embeddings:
+            nn.init.uniform_(emb, -0.02, 0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        all_patches = []
+        for ps, proj, scale_emb in zip(
+                self.patch_sizes, self.projections, self.scale_embeddings):
+            if x.dim() == 3:
+                # (B, L, C) multi-channel
+                p = x.unfold(1, ps, ps)        # (B, N, C, ps)
+                B, N, C, _ps = p.shape
+                p = p.reshape(B, N, C * _ps)   # (B, N, C*ps)
+            else:
+                # (B, L) single-channel
+                p = x.unfold(-1, ps, ps)       # (B, N, ps)
+            p = proj(p) + scale_emb            # (B, N, d_model)
+            all_patches.append(p)
+        return torch.cat(all_patches, dim=1)   # (B, total_patches, d_model)
+
+
+# ── Series Decomposition ──────────────────────────────────────────
+
+class SeriesDecomposition(nn.Module):
+    """Moving-average trend-residual decomposition (Autoformer-style)."""
+
+    def __init__(self, kernel_size: int = 5):
+        super().__init__()
+        self.avg = nn.AvgPool1d(
+            kernel_size, stride=1, padding=kernel_size // 2,
+            count_include_pad=False)
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: (B, N, d) sequence of patch representations.
+        Returns:
+            residual: (B, N, d) high-frequency component.
+            trend:    (B, N, d) low-frequency component.
+        """
+        # AvgPool1d expects (B, C, L), so transpose
+        trend = self.avg(x.transpose(1, 2)).transpose(1, 2)
+        return x - trend, trend
 
 
 # ── Cross-Attention Decoder Layer ───────────────────────────────────
 
 class CrossAttentionDecoderLayer(nn.Module):
-    """Single decoder layer: self-attn on query, then cross-attn to encoder output."""
+    """Single decoder layer: cross-attn to encoder output + FFN."""
 
     def __init__(self, cfg: PhantomConfig):
         super().__init__()
@@ -100,30 +202,53 @@ class CrossAttentionDecoderLayer(nn.Module):
         return query
 
 
-# ── Mixture of Gaussians Head ───────────────────────────────────────
+# ── Mixture Forecast Head ──────────────────────────────────────────
 
-class MoGHead(nn.Module):
+class MixtureHead(nn.Module):
+    """Mixture distribution head supporting Gaussian and Student-t components.
+
+    When use_student_t=False: outputs (log_pi, mu, sigma, None)  — Gaussian
+    When use_student_t=True:  outputs (log_pi, mu, sigma, nu)    — Student-t
+    """
+
     def __init__(self, cfg: PhantomConfig):
         super().__init__()
         self.K = cfg.n_components
+        self.use_student_t = cfg.use_student_t
         self.log_sigma_min = cfg.log_sigma_min
         self.log_sigma_max = cfg.log_sigma_max
+        self.log_nu_min = cfg.log_nu_min
+        self.log_nu_max = cfg.log_nu_max
+
+        out_dim = 4 * cfg.n_components if cfg.use_student_t else 3 * cfg.n_components
         self.net = nn.Sequential(
             nn.Linear(cfg.d_model, cfg.head_hidden),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.head_hidden, 3 * cfg.n_components),
+            nn.Linear(cfg.head_hidden, out_dim),
         )
 
     def forward(self, z: torch.Tensor):
         out = self.net(z)
         log_pi_raw = out[:, :self.K]
         mu = out[:, self.K:2*self.K]
-        log_sigma = out[:, 2*self.K:]
+        log_sigma = out[:, 2*self.K:3*self.K]
+
         log_pi = F.log_softmax(log_pi_raw, dim=-1)
         log_sigma = log_sigma.clamp(self.log_sigma_min, self.log_sigma_max)
         sigma = log_sigma.exp()
-        return log_pi, mu, sigma
+
+        if self.use_student_t:
+            log_nu = out[:, 3*self.K:]
+            log_nu = log_nu.clamp(self.log_nu_min, self.log_nu_max)
+            nu = log_nu.exp()
+            return log_pi, mu, sigma, nu
+
+        return log_pi, mu, sigma, None
+
+
+# Backward-compatible alias
+MoGHead = MixtureHead
 
 
 # ── Full Model ──────────────────────────────────────────────────────
@@ -138,17 +263,31 @@ class PhantomModel(nn.Module):
        enabling classifier-free guidance at inference.
     3. Auxiliary heads: SDE type classifier + volatility regressor force
        the encoder to extract input-dependent features.
+
+    v2 additions (all backward-compatible, toggled via config):
+    4. Student-t mixture head for heavy-tailed distributions.
+    5. Multi-scale patching for multi-resolution temporal patterns.
+    6. Multi-channel input (trailing realized vol features).
+    7. In-model series decomposition for trend/residual separation.
     """
 
     def __init__(self, cfg: PhantomConfig):
         super().__init__()
         self.cfg = cfg
 
-        # Encoder
-        self.patch_embed = PatchEmbedding(cfg)
-        n_positions = cfg.n_patches
-        self.pos_enc = nn.Parameter(torch.empty(1, n_positions, cfg.d_model))
-        nn.init.uniform_(self.pos_enc, -0.02, 0.02)
+        # Encoder input
+        if cfg.patch_sizes is not None:
+            self.patch_embed = MultiScalePatchEmbedding(cfg)
+            n_positions = cfg.n_patches
+            # Scale embeddings are inside MultiScalePatchEmbedding;
+            # pos_enc is additive (zero-init so it has no effect initially)
+            self.pos_enc = nn.Parameter(torch.zeros(1, n_positions, cfg.d_model))
+        else:
+            self.patch_embed = PatchEmbedding(cfg)
+            n_positions = cfg.n_patches
+            self.pos_enc = nn.Parameter(torch.empty(1, n_positions, cfg.d_model))
+            nn.init.uniform_(self.pos_enc, -0.02, 0.02)
+
         self.input_dropout = nn.Dropout(cfg.dropout)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -161,18 +300,25 @@ class PhantomModel(nn.Module):
             norm=nn.LayerNorm(cfg.d_model),
         )
 
-        # Cross-attention decoder (replaces CLS + additive horizon)
+        # Series decomposition blocks (v2)
+        if cfg.use_decomposition:
+            self.decomp_blocks = nn.ModuleList([
+                SeriesDecomposition(cfg.decomp_kernel)
+                for _ in range(cfg.n_layers)
+            ])
+
+        # Cross-attention decoder
         self.horizon_embed = nn.Embedding(max(cfg.horizons) + 1, cfg.d_model)
         self.decoder_layers = nn.ModuleList([
             CrossAttentionDecoderLayer(cfg) for _ in range(cfg.n_decoder_layers)
         ])
         self.decoder_norm = nn.LayerNorm(cfg.d_model)
 
-        # MoG forecast head
-        self.head = MoGHead(cfg)
+        # Mixture forecast head
+        self.head = MixtureHead(cfg)
 
-        # Auxiliary heads (Fix #1: force encoder to extract features)
-        self.aux_pool = nn.AdaptiveAvgPool1d(1)  # pool encoder output for aux tasks
+        # Auxiliary heads
+        self.aux_pool = nn.AdaptiveAvgPool1d(1)
         self.sde_classifier = nn.Linear(cfg.d_model, cfg.n_sde_types)
         self.vol_regressor = nn.Linear(cfg.d_model, 1)
 
@@ -191,14 +337,23 @@ class PhantomModel(nn.Module):
         """Encode context into patch representations.
 
         Args:
-            x: (B, L) raw daily log-returns.
+            x: (B, L) or (B, L, C) raw daily log-returns (optionally multi-channel).
         Returns:
             enc_out: (B, N, d_model) patch representations.
         """
         patches = self.patch_embed(x)            # (B, N, d_model)
         patches = patches + self.pos_enc
         patches = self.input_dropout(patches)
-        return self.encoder(patches)              # (B, N, d_model)
+
+        if self.cfg.use_decomposition:
+            # Manual layer iteration with decomposition between layers
+            for i, layer in enumerate(self.encoder.layers):
+                patches = layer(patches)
+                residual, _trend = self.decomp_blocks[i](patches)
+                patches = residual
+            return self.encoder.norm(patches)
+        else:
+            return self.encoder(patches)
 
     def decode(self, enc_out: torch.Tensor, horizon: torch.Tensor):
         """Decode distribution parameters via cross-attention.
@@ -207,12 +362,11 @@ class PhantomModel(nn.Module):
             enc_out: (B, N, d_model) encoder patch representations.
             horizon: (B,) forecast horizon in days.
         Returns:
-            log_pi, mu, sigma: MoG parameters.
+            log_pi, mu, sigma: mixture parameters.
+            nu: degrees of freedom (None for Gaussian).
         """
-        # Horizon query token
         query = self.horizon_embed(horizon).unsqueeze(1)  # (B, 1, d_model)
 
-        # Cross-attention: query attends to encoder patches
         for layer in self.decoder_layers:
             query = layer(query, enc_out)
 
@@ -226,23 +380,23 @@ class PhantomModel(nn.Module):
         Returns:
             log_pi: (B, K) log mixture weights.
             mu:     (B, K) component means.
-            sigma:  (B, K) component stds.
+            sigma:  (B, K) component stds/scales.
+            nu:     (B, K) degrees of freedom, or None for Gaussian.
         """
         enc_out = self.encode(x)  # (B, N, d_model)
 
-        # Fix #2: Condition dropout — zero encoder output with probability p
+        # Condition dropout — zero encoder output with probability p
         if self.training and self.cfg.cond_drop_prob > 0:
-            mask = torch.rand(x.size(0), 1, 1, device=x.device) > self.cfg.cond_drop_prob
-            enc_out = enc_out * mask  # (B, N, d_model) with some samples zeroed
+            mask = torch.rand(x.size(0), 1, 1, device=enc_out.device) > self.cfg.cond_drop_prob
+            enc_out = enc_out * mask
 
-        log_pi, mu, sigma = self.decode(enc_out, horizon)
-        return log_pi, mu, sigma
+        return self.decode(enc_out, horizon)
 
     def forward_auxiliary(self, x: torch.Tensor):
         """Compute auxiliary predictions (SDE type + volatility).
 
         Args:
-            x: (B, L) raw daily log-returns.
+            x: (B, L) or (B, L, C) raw daily log-returns.
         Returns:
             sde_logits: (B, n_sde_types) classification logits.
             vol_pred:   (B,) predicted realized volatility.
@@ -267,20 +421,28 @@ class PhantomModel(nn.Module):
         enc_out = self.encode(x)
 
         # Conditional prediction
-        log_pi_c, mu_c, sigma_c = self.decode(enc_out, horizon)
+        log_pi_c, mu_c, sigma_c, nu_c = self.decode(enc_out, horizon)
 
         # Unconditional prediction (zeroed encoder)
         zeros = torch.zeros_like(enc_out)
-        log_pi_u, mu_u, sigma_u = self.decode(zeros, horizon)
+        log_pi_u, mu_u, sigma_u, nu_u = self.decode(zeros, horizon)
 
         # Guided output: extrapolate away from unconditional
         mu = mu_u + guidance_scale * (mu_c - mu_u)
-        # For sigma: interpolate in log space
+
         log_sigma_c = sigma_c.log()
         log_sigma_u = sigma_u.log()
         log_sigma = log_sigma_u + guidance_scale * (log_sigma_c - log_sigma_u)
         sigma = log_sigma.clamp(self.cfg.log_sigma_min, self.cfg.log_sigma_max).exp()
-        # Weights: use conditional
-        log_pi = log_pi_c
 
-        return log_pi, mu, sigma
+        log_pi = log_pi_c  # Use conditional weights
+
+        # Guide nu in log space if Student-t
+        nu = None
+        if nu_c is not None and nu_u is not None:
+            log_nu_c = nu_c.log()
+            log_nu_u = nu_u.log()
+            log_nu = log_nu_u + guidance_scale * (log_nu_c - log_nu_u)
+            nu = log_nu.clamp(self.cfg.log_nu_min, self.cfg.log_nu_max).exp()
+
+        return log_pi, mu, sigma, nu

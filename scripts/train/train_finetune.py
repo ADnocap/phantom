@@ -2,11 +2,21 @@
 """
 Phase 2: Fine-tune pre-trained Phantom on real BTC data.
 
-Mixed batches: 70% synthetic (energy distance) + 30% real (CRPS).
+Mixed batches: synthetic (energy distance) + real (CRPS).
 Gradual unfreezing with layer-wise learning rate decay.
 
+v2 additions:
+  - Real fraction annealing (--anneal_real_fraction)
+  - BTC-calibrated SDEs for synthetic data (--btc_calibrated_sdes)
+  - Student-t, Gumbel-Softmax, quantile loss pass-through
+
 Usage:
+  # v1:
   python train_finetune.py --pretrained checkpoints/best.pt
+
+  # v2 with annealing:
+  python train_finetune.py --pretrained checkpoints/best.pt \\
+    --anneal_real_fraction --start_real_fraction 0.1 --end_real_fraction 0.7
 """
 
 import argparse
@@ -17,10 +27,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch.utils.data import DataLoader, Dataset
 
 from src.model import PhantomConfig, PhantomModel
-from src.losses import combined_loss, crps_loss, nll_loss
+from src.losses import combined_loss, crps_loss, nll_loss, quantile_loss
 from src.data import OnlineDataset
 from src.btc_data import fetch_btc_daily, temporal_split
 
@@ -45,7 +55,7 @@ class RealBTCDataset(Dataset):
 # ── Mixed DataLoader (synthetic + real) ─────────────────────────────
 
 class MixedBatchSampler:
-    """Yields batches with ~70% synthetic + ~30% real samples."""
+    """Yields batches with configurable synthetic/real split."""
 
     def __init__(self, real_dataset, synthetic_dataset, batch_size=256,
                  real_fraction=0.3, steps_per_epoch=1000):
@@ -56,9 +66,13 @@ class MixedBatchSampler:
         self.n_synth = batch_size - self.n_real
         self.steps_per_epoch = steps_per_epoch
 
+    def update_fractions(self, real_fraction):
+        """Update real/synthetic split (for annealing)."""
+        self.n_real = max(1, int(self.batch_size * real_fraction))
+        self.n_synth = self.batch_size - self.n_real
+
     def get_batch(self, epoch, step, device):
         """Get a mixed batch of real + synthetic data."""
-        # Real samples (random with replacement)
         real_idxs = torch.randint(0, len(self.real), (self.n_real,))
         rx, rh, ry = [], [], []
         for idx in real_idxs:
@@ -68,7 +82,6 @@ class MixedBatchSampler:
         real_h = torch.stack(rh).to(device)
         real_y = torch.stack(ry).to(device)
 
-        # Synthetic samples (from iterator)
         synth_x, synth_h, synth_yb = [], [], []
         for _ in range(self.n_synth):
             x, h, yb = next(self._synth_iter)
@@ -83,7 +96,6 @@ class MixedBatchSampler:
         """Initialize the synthetic data iterator."""
         loader = DataLoader(
             self.synthetic, batch_size=1, num_workers=0, drop_last=True)
-        # Flatten: DataLoader wraps each sample in an extra dim
         def flatten_iter():
             for batch in loader:
                 # OnlineDataset yields (x, h, yb, sde_idx, rv) — only need first 3
@@ -139,9 +151,9 @@ def validate_real(model, val_X, val_H, val_Y, device, batch_size=512):
         x = val_X[i:i+batch_size].to(device)
         h = val_H[i:i+batch_size].to(device)
         y = val_Y[i:i+batch_size].to(device)
-        log_pi, mu, sigma = model(x, h)
-        total_crps += crps_loss(log_pi, mu, sigma, y).item()
-        total_nll += nll_loss(log_pi, mu, sigma, y).item()
+        log_pi, mu, sigma, nu = model(x, h)
+        total_crps += crps_loss(log_pi, mu, sigma, y, nu=nu).item()
+        total_nll += nll_loss(log_pi, mu, sigma, y, nu=nu).item()
         n += 1
     model.train()
     return {
@@ -178,7 +190,7 @@ def parse_args():
 
     # Mixed training
     p.add_argument('--real_fraction', type=float, default=0.3,
-                   help='Fraction of real data in each batch')
+                   help='Fraction of real data in each batch (or starting fraction if annealing)')
     p.add_argument('--n_branches', type=int, default=128)
 
     # Training
@@ -204,6 +216,9 @@ def parse_args():
     p.add_argument('--nll_weight_real', type=float, default=0.05)
     p.add_argument('--n_model_samples', type=int, default=256)
     p.add_argument('--nll_weight_synth', type=float, default=0.1)
+    p.add_argument('--quantile_weight', type=float, default=0.0,
+                   help='Weight for auxiliary quantile loss (0 = disabled)')
+    p.add_argument('--use_gumbel_softmax', action='store_true', default=False)
 
     # Logging
     p.add_argument('--log_every', type=int, default=50)
@@ -217,6 +232,16 @@ def parse_args():
     p.add_argument('--device', type=str, default=None)
     p.add_argument('--amp', action='store_true', default=True)
     p.add_argument('--no_amp', action='store_true')
+
+    # ── v2: Domain adaptation ──
+    p.add_argument('--anneal_real_fraction', action='store_true', default=False,
+                   help='Linearly anneal real fraction over training')
+    p.add_argument('--start_real_fraction', type=float, default=0.1,
+                   help='Initial real fraction (when annealing)')
+    p.add_argument('--end_real_fraction', type=float, default=0.7,
+                   help='Final real fraction (when annealing)')
+    p.add_argument('--sde_version', type=str, default='v1', choices=['v1', 'v2'],
+                   help='SDE family version for synthetic data during fine-tuning')
 
     return p.parse_args()
 
@@ -250,6 +275,8 @@ def main():
     pretrained_state = {k: v.clone().to(device) for k, v in model.state_dict().items()}
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {n_params:,} params | K={cfg.n_components} | pre-train step={ckpt['step']:,}")
+    if cfg.use_student_t:
+        print("Head: Mixture of Student-t")
 
     # ── Fetch real BTC data ──
     print("\nFetching BTC data...")
@@ -259,6 +286,7 @@ def main():
         context_len=cfg.context_len,
         val_start=args.val_start,
         test_start=args.test_start,
+        n_input_channels=cfg.n_input_channels,
     )
 
     train_real = RealBTCDataset(*splits['train'])
@@ -269,17 +297,23 @@ def main():
     synth_dataset = OnlineDataset(
         context_len=cfg.context_len,
         n_branches=args.n_branches,
-        samples_per_epoch=100_000_000,  # effectively infinite
+        samples_per_epoch=100_000_000,
         seed=args.seed,
+        n_input_channels=cfg.n_input_channels,
+        sde_version=args.sde_version,
     )
 
     # ── Mixed batch helper ──
+    initial_real_frac = args.start_real_fraction if args.anneal_real_fraction else args.real_fraction
     mixer = MixedBatchSampler(
         train_real, synth_dataset,
         batch_size=args.batch_size,
-        real_fraction=args.real_fraction,
+        real_fraction=initial_real_frac,
     )
     mixer.init_synthetic_iter(args.seed)
+
+    if args.anneal_real_fraction:
+        print(f"Real fraction annealing: {args.start_real_fraction:.1%} → {args.end_real_fraction:.1%}")
 
     # ── Optimizer with layer-wise LR decay ──
     param_groups = []
@@ -289,13 +323,15 @@ def main():
                    list(model.horizon_embed.parameters()) +
                    list(model.decoder_layers.parameters()) +
                    list(model.decoder_norm.parameters()))
-    # Include aux heads if they exist
     if hasattr(model, 'sde_classifier'):
         head_params += list(model.sde_classifier.parameters())
     if hasattr(model, 'vol_regressor'):
         head_params += list(model.vol_regressor.parameters())
     if hasattr(model, 'aux_pool'):
         head_params += list(model.aux_pool.parameters())
+    # Include decomposition blocks if present
+    if hasattr(model, 'decomp_blocks'):
+        head_params += list(model.decomp_blocks.parameters())
     param_groups.append({'params': head_params, 'lr': args.lr_head, 'name': 'head+decoder'})
 
     # Encoder layers: decaying LR from top to bottom
@@ -352,9 +388,10 @@ def main():
     running_count = 0
     t_start = time.time()
 
-    # Initially freeze encoder (keep head, decoder, horizon, aux unfrozen)
+    # Initially freeze encoder
     encoder_frozen = True
-    unfrozen_keys = ['head', 'horizon', 'decoder', 'sde_classifier', 'vol_regressor', 'aux_pool']
+    unfrozen_keys = ['head', 'horizon', 'decoder', 'sde_classifier', 'vol_regressor',
+                     'aux_pool', 'decomp_blocks']
     for name, param in model.named_parameters():
         if not any(k in name for k in unfrozen_keys):
             param.requires_grad = False
@@ -372,6 +409,13 @@ def main():
             print(f"Phase 2b: full model unfrozen at step {step}")
             print(f"{'='*60}\n")
 
+        # Anneal real fraction
+        if args.anneal_real_fraction:
+            progress = step / args.steps
+            real_frac = (args.start_real_fraction +
+                         progress * (args.end_real_fraction - args.start_real_fraction))
+            mixer.update_fractions(real_frac)
+
         # LR schedule (cosine decay)
         frac = get_lr(step, args.warmup_steps, args.steps, 1.0, args.min_lr / args.lr_head)
         for pg in param_groups:
@@ -383,18 +427,24 @@ def main():
         real_x, real_h, real_y, synth_x, synth_h, synth_yb = mixer.get_batch(0, step, device)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            # ── Real data: CRPS + aux NLL ──
-            lp_r, mu_r, sig_r = model(real_x, real_h)
-            loss_real_crps = crps_loss(lp_r, mu_r, sig_r, real_y)
-            loss_real_nll = nll_loss(lp_r, mu_r, sig_r, real_y)
+            # ── Real data: CRPS + aux NLL + optional quantile ──
+            lp_r, mu_r, sig_r, nu_r = model(real_x, real_h)
+            loss_real_crps = crps_loss(lp_r, mu_r, sig_r, real_y, nu=nu_r)
+            loss_real_nll = nll_loss(lp_r, mu_r, sig_r, real_y, nu=nu_r)
             loss_real = loss_real_crps + args.nll_weight_real * loss_real_nll
+            if args.quantile_weight > 0:
+                loss_real = loss_real + args.quantile_weight * quantile_loss(
+                    lp_r, mu_r, sig_r, real_y, nu=nu_r)
 
             # ── Synthetic data: energy distance + aux NLL ──
-            lp_s, mu_s, sig_s = model(synth_x, synth_h)
+            lp_s, mu_s, sig_s, nu_s = model(synth_x, synth_h)
             loss_synth, ed_val, nll_s_val = combined_loss(
                 lp_s, mu_s, sig_s, synth_yb,
                 n_model_samples=args.n_model_samples,
                 nll_weight=args.nll_weight_synth,
+                nu=nu_s,
+                use_gumbel_softmax=args.use_gumbel_softmax,
+                quantile_weight=args.quantile_weight,
             )
 
             # ── Combined ──
@@ -429,12 +479,15 @@ def main():
             elapsed = time.time() - t_start
             sps = step / elapsed
 
-            logger.log({
+            log_dict = {
                 'loss': avg_loss,
                 'real_crps': avg_crps,
                 'synth_ed': avg_ed,
                 'steps/s': sps,
-            }, step=step)
+            }
+            if args.anneal_real_fraction:
+                log_dict['real_frac'] = mixer.n_real / args.batch_size
+            logger.log(log_dict, step=step)
             running_loss, running_real_crps, running_synth_ed, running_count = 0, 0, 0, 0
 
         # Validation

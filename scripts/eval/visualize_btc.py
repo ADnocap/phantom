@@ -18,30 +18,33 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from scipy.stats import norm as scipy_norm
+from scipy.stats import norm as scipy_norm, t as scipy_t
 
 from src.model import PhantomConfig, PhantomModel
 from src.btc_data import fetch_btc_daily, temporal_split
+from src.data import compute_vol_features
 
 
-def mog_cdf(y, pi, mu, sigma):
+def mixture_cdf_np(y, pi, mu, sigma, nu=None):
+    if nu is not None:
+        return np.sum(pi * scipy_t.cdf(y, df=nu, loc=mu, scale=sigma))
     return np.sum(pi * scipy_norm.cdf(y, loc=mu, scale=sigma))
 
 
-def mog_quantile(p, pi, mu, sigma):
+def mixture_quantile_np(p, pi, mu, sigma, nu=None):
     lo, hi = -5.0, 5.0
     for _ in range(60):
         mid = (lo + hi) / 2
-        if mog_cdf(mid, pi, mu, sigma) < p:
+        if mixture_cdf_np(mid, pi, mu, sigma, nu) < p:
             lo = mid
         else:
             hi = mid
     return (lo + hi) / 2
 
 
-def sample_mog(pi, mu, sigma, n=10000):
-    c = np.random.choice(len(pi), size=n, p=pi)
-    return np.random.normal(mu[c], sigma[c])
+# Backward-compatible aliases
+mog_cdf = mixture_cdf_np
+mog_quantile = mixture_quantile_np
 
 
 def main():
@@ -64,6 +67,8 @@ def main():
     print(f"Model: step {ckpt['step']:,}, K={cfg.n_components}")
 
     use_cfg = args.cfg_scale > 0 and hasattr(model, 'forward_cfg')
+    use_student_t = getattr(cfg, 'use_student_t', False)
+    n_channels = getattr(cfg, 'n_input_channels', 1)
 
     # ── Load BTC data ──
     btc = fetch_btc_daily(cache_path=args.btc_cache)
@@ -100,28 +105,36 @@ def main():
                 continue
 
             fwd = log_returns[start + context_len:start + context_len + h].sum()
-            x = torch.from_numpy(ctx.astype(np.float32)).unsqueeze(0)
+
+            # Build input tensor (multi-channel if needed)
+            if n_channels > 1:
+                vol_feats = compute_vol_features(ctx)
+                x_arr = np.concatenate([ctx.astype(np.float32).reshape(-1, 1), vol_feats], axis=1)
+            else:
+                x_arr = ctx.astype(np.float32)
+            x = torch.from_numpy(x_arr).unsqueeze(0)
             h_t = torch.tensor([h])
 
             with torch.no_grad():
                 if use_cfg:
-                    log_pi, mu, sigma = model.forward_cfg(x, h_t, args.cfg_scale)
+                    log_pi, mu, sigma, nu = model.forward_cfg(x, h_t, args.cfg_scale)
                 else:
-                    log_pi, mu, sigma = model(x, h_t)
+                    log_pi, mu, sigma, nu = model(x, h_t)
 
             pi = torch.exp(log_pi)[0].numpy()
             mu_np = mu[0].numpy()
             sigma_np = sigma[0].numpy()
+            nu_np = nu[0].numpy() if nu is not None else None
 
             # PIT
-            pit = mog_cdf(fwd, pi, mu_np, sigma_np)
+            pit = mixture_cdf_np(fwd, pi, mu_np, sigma_np, nu_np)
             all_pits.append(pit)
 
             # Coverage
             for level in levels:
                 alpha = (1 - level) / 2
-                q_lo = mog_quantile(alpha, pi, mu_np, sigma_np)
-                q_hi = mog_quantile(1 - alpha, pi, mu_np, sigma_np)
+                q_lo = mixture_quantile_np(alpha, pi, mu_np, sigma_np, nu_np)
+                q_hi = mixture_quantile_np(1 - alpha, pi, mu_np, sigma_np, nu_np)
                 all_coverages[level].append(1 if q_lo <= fwd <= q_hi else 0)
 
             # Save some for visualization (spread across time, h=5 only)
@@ -131,7 +144,7 @@ def main():
                     'ctx': ctx.copy(),
                     'fwd_actual': fwd,
                     'h': h,
-                    'pi': pi, 'mu': mu_np, 'sigma': sigma_np,
+                    'pi': pi, 'mu': mu_np, 'sigma': sigma_np, 'nu': nu_np,
                     'date_ctx_end': dates[start + context_len - 1],
                     'date_pred_end': dates[min(start + context_len + h - 1, len(dates) - 1)],
                     'closes_ctx': closes[start:start + context_len],
@@ -226,7 +239,8 @@ def main():
         # Predicted distribution fan (shaded quantile regions)
         last_price_log = np.log(d['closes_ctx'][-1] / base_price)
         quantile_levels = [0.025, 0.10, 0.25, 0.50, 0.75, 0.90, 0.975]
-        q_values = [mog_quantile(q, d['pi'], d['mu'], d['sigma']) for q in quantile_levels]
+        q_values = [mixture_quantile_np(q, d['pi'], d['mu'], d['sigma'], d.get('nu'))
+                     for q in quantile_levels]
 
         # Convert log-return quantiles to price levels
         pred_x = len(d['ctx']) - 1 + d['h']  # end of prediction period

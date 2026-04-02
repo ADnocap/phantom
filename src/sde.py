@@ -2,12 +2,18 @@
 Numba-JIT-compiled SDE simulators for synthetic data generation.
 
 Each simulator runs at hourly resolution (dt = 1/(365*24)) and returns
-daily log-returns. Five SDE families are implemented:
+daily log-returns. Seven SDE families are implemented:
+
+v1 (original):
   - GBM (Geometric Brownian Motion)
   - Merton Jump-Diffusion
   - Kou Double-Exponential Jump-Diffusion
   - Bates (Stochastic Volatility + Jumps)
   - Regime-Switching GBM
+
+v2 (additions):
+  - Multifractal Random Walk (MRW) — captures scale-dependent vol clustering
+  - Fractional OU with Stochastic Volatility — captures long-memory effects
 """
 
 import numpy as np
@@ -19,7 +25,9 @@ DT = 1.0 / (365 * 24)        # hourly step in years
 STEPS_PER_DAY = 24
 
 
-# ── Individual SDE simulators ────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# v1 SDE simulators (original, numba-JIT)
+# ═══════════════════════════════════════════════════════════════════
 
 @njit(cache=True)
 def _sim_gbm(mu, sigma, n_days):
@@ -392,7 +400,182 @@ def _sim_regime_switching_forward_batch(mus, sigmas, Q, n_regimes,
     return results
 
 
-# ── Context + branched futures dispatch ──────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# v2 SDE simulators (pure numpy — FFT-based, not numba)
+# ═══════════════════════════════════════════════════════════════════
+
+def _generate_fbm_increments(n, H, rng=None):
+    """Generate fractional Brownian motion increments via Davies-Harte (circulant embedding).
+
+    Args:
+        n: Number of increments to generate.
+        H: Hurst exponent in (0, 1).
+        rng: numpy random generator.
+
+    Returns:
+        (n,) array of fBM increments.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Autocovariance of fGn: gamma(k) = 0.5 * (|k-1|^(2H) - 2|k|^(2H) + |k+1|^(2H))
+    m = 2 * n
+    k = np.arange(m)
+    gamma = 0.5 * (np.abs(k - 1) ** (2 * H) - 2 * np.abs(k) ** (2 * H) + np.abs(k + 1) ** (2 * H))
+    # Make it circulant: gamma_circ = [gamma(0), gamma(1), ..., gamma(n), gamma(n-1), ..., gamma(1)]
+    gamma_circ = np.concatenate([gamma[:n + 1], gamma[n - 1:0:-1]])
+
+    # Eigenvalues via FFT (should be non-negative for valid covariance)
+    eigenvalues = np.fft.fft(gamma_circ).real
+    eigenvalues = np.maximum(eigenvalues, 0)  # numerical safety
+
+    # Sample in frequency domain
+    z = rng.standard_normal(len(eigenvalues)) + 1j * rng.standard_normal(len(eigenvalues))
+    w = np.fft.ifft(np.sqrt(eigenvalues) * z).real
+
+    return w[:n]
+
+
+def _sim_mrw_daily(mu, sigma, lam_param, T_days, n_days, rng=None):
+    """Simulate Multifractal Random Walk and return daily log-returns.
+
+    The MRW generates returns with multifractal (scale-dependent) vol clustering:
+        r_t = mu*dt + sigma * exp(omega_t - lam^2 * log(T)) * epsilon_t
+
+    where omega_t is a Gaussian process with covariance:
+        Cov(omega_i, omega_j) = lam^2 * log(T / max(|i-j|, 1))
+
+    Args:
+        mu: Annualized drift.
+        sigma: Base annualized volatility.
+        lam_param: Intermittency parameter (controls multifractality strength).
+        T_days: Integral scale in days.
+        n_days: Number of days to simulate.
+        rng: numpy random generator.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n = n_days
+    T = max(T_days, n + 1)  # integral scale must exceed series length
+
+    # Build covariance matrix for omega
+    # Cov(i, j) = lam^2 * log(T / max(|i-j|, 1)) for |i-j| < T, else 0
+    lags = np.arange(n)
+    cov_row = np.zeros(n)
+    cov_row[0] = lam_param ** 2 * np.log(T)
+    for k in range(1, min(n, T)):
+        cov_row[k] = lam_param ** 2 * np.log(T / k)
+
+    # Circulant embedding for fast Gaussian field generation
+    cov_circ = np.concatenate([cov_row, cov_row[-2:0:-1]])
+    eigenvalues = np.fft.fft(cov_circ).real
+    eigenvalues = np.maximum(eigenvalues, 0)
+
+    z = rng.standard_normal(len(eigenvalues)) + 1j * rng.standard_normal(len(eigenvalues))
+    omega = np.fft.ifft(np.sqrt(eigenvalues) * z).real[:n]
+
+    # Generate returns
+    dt_day = 1.0 / 365
+    daily_vol = sigma * np.sqrt(dt_day)
+    epsilon = rng.standard_normal(n)
+
+    # Normalize omega so variance matches lam^2 * log(T)
+    vol_multiplier = np.exp(omega - 0.5 * lam_param ** 2 * np.log(T))
+    returns = mu * dt_day + daily_vol * vol_multiplier * epsilon
+
+    return returns.astype(np.float32)
+
+
+def _sim_frac_ou_daily(mu, sigma, theta, kappa_vol, xi_vol, H, n_days, rng=None):
+    """Simulate Fractional OU with Stochastic Volatility, return daily log-returns.
+
+    Price dynamics (daily):
+        r_t = mu*dt + sigma_t * dB^H_t
+
+    where B^H is fractional Brownian motion with Hurst parameter H, and:
+        log(sigma_t) follows an OU process:
+        d(log sigma_t) = kappa_vol * (log(sigma) - log(sigma_t)) * dt + xi_vol * dW_t
+
+    Args:
+        mu: Annualized drift.
+        sigma: Long-run annualized volatility.
+        theta: Mean-reversion speed for the OU component of returns.
+        kappa_vol: Mean-reversion speed for log-vol.
+        xi_vol: Volatility of log-volatility.
+        H: Hurst exponent for fBM (< 0.5 = mean-reverting, > 0.5 = trending).
+        n_days: Number of days to simulate.
+        rng: numpy random generator.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    dt_day = 1.0 / 365
+
+    # Generate fBM increments for the price process
+    fbm_increments = _generate_fbm_increments(n_days, H, rng)
+    # Scale to daily
+    fbm_increments = fbm_increments * np.sqrt(dt_day) ** (2 * H)
+
+    # Simulate stochastic log-vol (standard OU with BM, not fBM)
+    log_vol = np.zeros(n_days)
+    log_sigma_base = np.log(sigma)
+    log_vol[0] = log_sigma_base
+
+    for t in range(1, n_days):
+        dW = np.sqrt(dt_day) * rng.standard_normal()
+        log_vol[t] = log_vol[t - 1] + kappa_vol * (log_sigma_base - log_vol[t - 1]) * dt_day + xi_vol * dW
+
+    sigma_t = np.exp(log_vol)  # (n_days,) instantaneous annualized vol
+
+    # Combine: returns with fractional noise and stochastic vol
+    returns = mu * dt_day + sigma_t * fbm_increments
+
+    return returns.astype(np.float32)
+
+
+# ── v2 with-state and forward-batch variants ───────────────────────
+
+def _sim_mrw_with_state(mu, sigma, lam_param, T_days, n_days, rng=None):
+    """MRW with terminal state for branching."""
+    returns = _sim_mrw_daily(mu, sigma, lam_param, T_days, n_days, rng)
+    log_S = float(np.sum(returns))
+    return returns, log_S
+
+
+def _sim_frac_ou_with_state(mu, sigma, theta, kappa_vol, xi_vol, H, n_days, rng=None):
+    """Fractional OU with terminal state for branching."""
+    returns = _sim_frac_ou_daily(mu, sigma, theta, kappa_vol, xi_vol, H, n_days, rng)
+    log_S = float(np.sum(returns))
+    return returns, log_S
+
+
+def _sim_mrw_forward_batch(mu, sigma, lam_param, T_days, log_S0, n_days, n_branches, rng=None):
+    """Branch N MRW paths from terminal state."""
+    if rng is None:
+        rng = np.random.default_rng()
+    results = np.empty(n_branches, dtype=np.float32)
+    for b in range(n_branches):
+        returns = _sim_mrw_daily(mu, sigma, lam_param, T_days, n_days, rng)
+        results[b] = np.sum(returns)
+    return results
+
+
+def _sim_frac_ou_forward_batch(mu, sigma, theta, kappa_vol, xi_vol, H,
+                                log_S0, n_days, n_branches, rng=None):
+    """Branch N Fractional OU paths from terminal state."""
+    if rng is None:
+        rng = np.random.default_rng()
+    results = np.empty(n_branches, dtype=np.float32)
+    for b in range(n_branches):
+        returns = _sim_frac_ou_daily(mu, sigma, theta, kappa_vol, xi_vol, H, n_days, rng)
+        results[b] = np.sum(returns)
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Context + branched futures dispatch
+# ═══════════════════════════════════════════════════════════════════
 
 def simulate_context_and_branches(sde_type, params, context_days, horizon_days, n_branches):
     """Simulate context path then branch N independent future paths.
@@ -403,7 +586,7 @@ def simulate_context_and_branches(sde_type, params, context_days, horizon_days, 
     Parameters
     ----------
     sde_type : str
-        One of 'gbm', 'merton', 'kou', 'bates', 'regime_switching'.
+        One of 'gbm', 'merton', 'kou', 'bates', 'regime_switching', 'mrw', 'frac_ou'.
     params : dict
         Parameter dict from sample_params.
     context_days : int
@@ -463,6 +646,27 @@ def simulate_context_and_branches(sde_type, params, context_days, horizon_days, 
             params['Q'], params['n_regimes'],
             log_S, regime_term, horizon_days, n_branches)
 
+    elif sde_type == 'mrw':
+        rng = params.get('_rng', None)
+        ctx, log_S = _sim_mrw_with_state(
+            params['mu'], params['sigma'],
+            params['lam_param'], params['T_days'], context_days, rng)
+        branches = _sim_mrw_forward_batch(
+            params['mu'], params['sigma'],
+            params['lam_param'], params['T_days'],
+            log_S, horizon_days, n_branches, rng)
+
+    elif sde_type == 'frac_ou':
+        rng = params.get('_rng', None)
+        ctx, log_S = _sim_frac_ou_with_state(
+            params['mu'], params['sigma'],
+            params['theta'], params['kappa_vol'], params['xi_vol'],
+            params['H'], context_days, rng)
+        branches = _sim_frac_ou_forward_batch(
+            params['mu'], params['sigma'],
+            params['theta'], params['kappa_vol'], params['xi_vol'],
+            params['H'], log_S, horizon_days, n_branches, rng)
+
     else:
         raise ValueError(f"Unknown SDE type: {sde_type}")
 
@@ -477,7 +681,7 @@ def sample_params(sde_type, rng=None):
     Parameters
     ----------
     sde_type : str
-        One of 'gbm', 'merton', 'kou', 'bates', 'regime_switching'.
+        One of 'gbm', 'merton', 'kou', 'bates', 'regime_switching', 'mrw', 'frac_ou'.
     rng : np.random.Generator or None
         Random number generator. If None, uses the default.
 
@@ -528,21 +732,38 @@ def sample_params(sde_type, rng=None):
         n_regimes = rng.choice([2, 3])
         mus = rng.uniform(-0.5, 1.5, size=n_regimes)
         sigmas = rng.uniform(0.3, 1.5, size=n_regimes)
-        # Build generator matrix Q
-        # Off-diagonal rates ~ Exponential with mean duration ~30 days
         Q = np.zeros((n_regimes, n_regimes))
         for r in range(n_regimes):
             for c in range(n_regimes):
                 if r != c:
-                    # rate = 1 / mean_duration_in_years
                     mean_days = rng.exponential(30.0)
-                    mean_days = max(mean_days, 5.0)  # floor at 5 days
+                    mean_days = max(mean_days, 5.0)
                     Q[r, c] = 365.0 / mean_days
             Q[r, r] = -Q[r, :].sum()
 
         return {
             'mus': mus, 'sigmas': sigmas,
             'Q': Q, 'n_regimes': n_regimes,
+        }
+
+    elif sde_type == 'mrw':
+        return {
+            'mu': mu,
+            'sigma': sigma,
+            'lam_param': rng.uniform(0.01, 0.15),   # intermittency
+            'T_days': int(rng.uniform(30, 365)),     # integral scale
+            '_rng': rng,
+        }
+
+    elif sde_type == 'frac_ou':
+        return {
+            'mu': mu,
+            'sigma': sigma,
+            'theta': rng.uniform(0.5, 10),           # mean reversion speed
+            'kappa_vol': rng.uniform(0.5, 5),        # vol mean reversion
+            'xi_vol': rng.uniform(0.1, 0.5),         # vol of vol
+            'H': rng.uniform(0.3, 0.7),              # Hurst exponent
+            '_rng': rng,
         }
 
     else:
@@ -557,7 +778,7 @@ def simulate_daily_returns(sde_type, params, n_days):
     Parameters
     ----------
     sde_type : str
-        One of 'gbm', 'merton', 'kou', 'bates', 'regime_switching'.
+        One of 'gbm', 'merton', 'kou', 'bates', 'regime_switching', 'mrw', 'frac_ou'.
     params : dict
         Parameter dict from sample_params.
     n_days : int
@@ -598,6 +819,22 @@ def simulate_daily_returns(sde_type, params, n_days):
             params['mus'], params['sigmas'],
             params['Q'], params['n_regimes'],
             n_days,
+        )
+
+    elif sde_type == 'mrw':
+        rng = params.get('_rng', None)
+        return _sim_mrw_daily(
+            params['mu'], params['sigma'],
+            params['lam_param'], params['T_days'],
+            n_days, rng,
+        )
+
+    elif sde_type == 'frac_ou':
+        rng = params.get('_rng', None)
+        return _sim_frac_ou_daily(
+            params['mu'], params['sigma'],
+            params['theta'], params['kappa_vol'], params['xi_vol'],
+            params['H'], n_days, rng,
         )
 
     else:

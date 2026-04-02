@@ -6,6 +6,10 @@ Two modes:
   - OnlineDataset: generates fresh SDE samples on-the-fly (infinite data, JointFM-style)
 
 Both yield (x, h, y_branches) where y_branches contains N branched future returns.
+
+v2 additions:
+  - SDE v2 families (MRW + Fractional OU)
+  - Multi-channel input features (trailing realized vol)
 """
 
 from pathlib import Path
@@ -16,10 +20,69 @@ from torch.utils.data import Dataset, IterableDataset
 
 from .sde import sample_params, simulate_context_and_branches
 
+# ── SDE family configurations ────────────────────────────────────
+
 SDE_TYPES = ['gbm', 'merton', 'kou', 'bates', 'regime_switching']
 SDE_TYPE_TO_IDX = {t: i for i, t in enumerate(SDE_TYPES)}
 SDE_WEIGHTS = [0.05, 0.15, 0.30, 0.30, 0.20]
+
+# v2: adds Multifractal Random Walk + Fractional OU
+SDE_TYPES_V2 = SDE_TYPES + ['mrw', 'frac_ou']
+SDE_TYPE_TO_IDX_V2 = {t: i for i, t in enumerate(SDE_TYPES_V2)}
+SDE_WEIGHTS_V2 = [0.04, 0.12, 0.22, 0.22, 0.15, 0.15, 0.10]
+
 HORIZONS = np.array([3, 5, 7])
+
+
+# ── Feature computation ──────────────────────────────────────────
+
+def compute_vol_features(returns: np.ndarray, windows: tuple = (7, 14, 30)) -> np.ndarray:
+    """Compute trailing realized vol features from log-returns.
+
+    Args:
+        returns: (L,) daily log-returns.
+        windows: Trailing window sizes in days.
+
+    Returns:
+        features: (L, len(windows)) trailing annualized vol at each window.
+    """
+    L = len(returns)
+    features = np.zeros((L, len(windows)), dtype=np.float32)
+    for j, w in enumerate(windows):
+        # Vectorized rolling std
+        for t in range(L):
+            start = max(0, t - w + 1)
+            window = returns[start:t + 1]
+            if len(window) > 1:
+                features[t, j] = np.std(window) * np.sqrt(365)
+    return features
+
+
+def _build_input(ctx: np.ndarray, n_input_channels: int) -> np.ndarray:
+    """Build model input from raw context returns.
+
+    Args:
+        ctx: (L,) daily log-returns.
+        n_input_channels: 1 = returns only, 4 = returns + 3 vol features.
+
+    Returns:
+        (L,) if n_input_channels == 1, else (L, C) float32.
+    """
+    if n_input_channels == 1:
+        return ctx.astype(np.float32)
+    else:
+        vol_feats = compute_vol_features(ctx)  # (L, 3)
+        returns_col = ctx.astype(np.float32).reshape(-1, 1)  # (L, 1)
+        return np.concatenate([returns_col, vol_feats], axis=1)  # (L, 4)
+
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+def _get_sde_config(sde_version: str):
+    """Return (types, type_to_idx, weights) for the given SDE version."""
+    if sde_version == 'v2':
+        return SDE_TYPES_V2, SDE_TYPE_TO_IDX_V2, SDE_WEIGHTS_V2
+    return SDE_TYPES, SDE_TYPE_TO_IDX, SDE_WEIGHTS
 
 
 # ── Shard-based dataset (pre-generated) ────────────────────────────
@@ -47,7 +110,6 @@ class ShardDataset(Dataset):
             if 'Y_branches' in d:
                 Yb_parts.append(d['Y_branches'])
             else:
-                # Backward compat: old shards with scalar Y
                 Yb_parts.append(d['Y'][:, None])
 
         self.X = np.concatenate(X_parts, axis=0)
@@ -83,11 +145,15 @@ class OnlineDataset(IterableDataset):
         n_branches: int = 128,
         samples_per_epoch: int = 1_000_000,
         seed: int | None = None,
+        n_input_channels: int = 1,
+        sde_version: str = 'v1',
     ):
         self.context_len = context_len
         self.n_branches = n_branches
         self.samples_per_epoch = samples_per_epoch
         self.seed = seed
+        self.n_input_channels = n_input_channels
+        self.sde_version = sde_version
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -103,8 +169,10 @@ class OnlineDataset(IterableDataset):
         rng = np.random.default_rng(seed)
         np.random.seed(rng.integers(0, 2**31))
 
+        sde_types, type_to_idx, weights = _get_sde_config(self.sde_version)
+
         for _ in range(per_worker):
-            sde_type = rng.choice(SDE_TYPES, p=SDE_WEIGHTS)
+            sde_type = rng.choice(sde_types, p=weights)
             params = sample_params(sde_type, rng=rng)
             h = int(rng.choice(HORIZONS))
 
@@ -112,11 +180,13 @@ class OnlineDataset(IterableDataset):
                 sde_type, params, self.context_len, h, self.n_branches
             )
 
-            sde_idx = SDE_TYPE_TO_IDX[sde_type]
+            sde_idx = type_to_idx[sde_type]
             realized_vol = np.std(ctx) * np.sqrt(365)  # annualized
 
+            x = _build_input(ctx, self.n_input_channels)
+
             yield (
-                torch.from_numpy(ctx.astype(np.float32)),
+                torch.from_numpy(x),
                 torch.tensor(h, dtype=torch.long),
                 torch.from_numpy(branches),
                 torch.tensor(sde_idx, dtype=torch.long),
@@ -134,25 +204,36 @@ def make_validation_batch(
     context_len: int = 60,
     n_branches: int = 128,
     seed: int = 999,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_input_channels: int = 1,
+    sde_version: str = 'v1',
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate a fixed validation batch with branched futures.
 
     Returns:
-        X          : (n_samples, context_len) float32
+        X          : (n_samples, context_len) or (n_samples, context_len, C) float32
         H          : (n_samples,) long
         Y_branches : (n_samples, n_branches) float32
+        SDE_idx    : (n_samples,) long
+        RV         : (n_samples,) float32
     """
     rng = np.random.default_rng(seed)
     np.random.seed(rng.integers(0, 2**31))
 
-    X = np.zeros((n_samples, context_len), dtype=np.float32)
+    sde_types, type_to_idx, weights = _get_sde_config(sde_version)
+
+    # Determine X shape
+    if n_input_channels > 1:
+        X = np.zeros((n_samples, context_len, n_input_channels), dtype=np.float32)
+    else:
+        X = np.zeros((n_samples, context_len), dtype=np.float32)
+
     H = np.zeros(n_samples, dtype=np.int64)
     Y_branches = np.zeros((n_samples, n_branches), dtype=np.float32)
     SDE_idx = np.zeros(n_samples, dtype=np.int64)
     RV = np.zeros(n_samples, dtype=np.float32)
 
     for i in range(n_samples):
-        sde_type = rng.choice(SDE_TYPES, p=SDE_WEIGHTS)
+        sde_type = rng.choice(sde_types, p=weights)
         params = sample_params(sde_type, rng=rng)
         h = int(rng.choice(HORIZONS))
 
@@ -160,10 +241,10 @@ def make_validation_batch(
             sde_type, params, context_len, h, n_branches
         )
 
-        X[i] = ctx
+        X[i] = _build_input(ctx, n_input_channels)
         H[i] = h
         Y_branches[i] = branches
-        SDE_idx[i] = SDE_TYPE_TO_IDX[sde_type]
+        SDE_idx[i] = type_to_idx[sde_type]
         RV[i] = np.std(ctx) * np.sqrt(365)
 
     return (torch.from_numpy(X), torch.from_numpy(H), torch.from_numpy(Y_branches),
