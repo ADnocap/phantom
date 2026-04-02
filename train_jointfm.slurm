@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=phantom-jfm
+#SBATCH --job-name=phantom-v3
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpua100
@@ -7,14 +7,14 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --mem-per-cpu=12G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/train_jfm_%j.out
-#SBATCH --error=logs/train_jfm_%j.err
+#SBATCH --output=logs/train_v3_%j.out
+#SBATCH --error=logs/train_v3_%j.err
 
-# ─── Phantom: JointFM-style energy distance training ─────────────────
-# No normalization — raw log-returns
-# 128 branched futures per sample (online generation)
-# Energy distance + auxiliary NLL loss
-# Large model: d=512, 8L, 8H
+# ─── Phantom v3: Cross-attn + aux tasks + condition dropout ──────────
+# Three anti-collapse mechanisms:
+#   1. Cross-attention decoder (horizon query attends to all patches)
+#   2. Auxiliary heads (SDE type classifier + vol regressor)
+#   3. Condition dropout (15%) for classifier-free guidance
 
 WORKDIR=/gpfs/workdir/dalbanal
 PROJECT=$WORKDIR/phantom
@@ -39,6 +39,8 @@ apptainer exec --nv --writable-tmpfs \
     --n_layers 8 \
     --d_ff 2048 \
     --n_components 5 \
+    --n_decoder_layers 2 \
+    --cond_drop_prob 0.15 \
     --dropout 0.2 \
     --epochs 30 \
     --batch_size 256 \
@@ -49,6 +51,7 @@ apptainer exec --nv --writable-tmpfs \
     --grad_clip 1.0 \
     --n_model_samples 256 \
     --nll_weight 0.1 \
+    --aux_weight 0.5 \
     --n_workers 8 \
     --val_every 2000 \
     --save_every 5000 \

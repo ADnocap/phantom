@@ -17,6 +17,7 @@ from torch.utils.data import Dataset, IterableDataset
 from .sde import sample_params, simulate_context_and_branches
 
 SDE_TYPES = ['gbm', 'merton', 'kou', 'bates', 'regime_switching']
+SDE_TYPE_TO_IDX = {t: i for i, t in enumerate(SDE_TYPES)}
 SDE_WEIGHTS = [0.05, 0.15, 0.30, 0.30, 0.20]
 HORIZONS = np.array([3, 5, 7])
 
@@ -111,10 +112,15 @@ class OnlineDataset(IterableDataset):
                 sde_type, params, self.context_len, h, self.n_branches
             )
 
+            sde_idx = SDE_TYPE_TO_IDX[sde_type]
+            realized_vol = np.std(ctx) * np.sqrt(365)  # annualized
+
             yield (
                 torch.from_numpy(ctx.astype(np.float32)),
                 torch.tensor(h, dtype=torch.long),
                 torch.from_numpy(branches),
+                torch.tensor(sde_idx, dtype=torch.long),
+                torch.tensor(realized_vol, dtype=torch.float32),
             )
 
     def __len__(self):
@@ -142,6 +148,8 @@ def make_validation_batch(
     X = np.zeros((n_samples, context_len), dtype=np.float32)
     H = np.zeros(n_samples, dtype=np.int64)
     Y_branches = np.zeros((n_samples, n_branches), dtype=np.float32)
+    SDE_idx = np.zeros(n_samples, dtype=np.int64)
+    RV = np.zeros(n_samples, dtype=np.float32)
 
     for i in range(n_samples):
         sde_type = rng.choice(SDE_TYPES, p=SDE_WEIGHTS)
@@ -155,5 +163,8 @@ def make_validation_batch(
         X[i] = ctx
         H[i] = h
         Y_branches[i] = branches
+        SDE_idx[i] = SDE_TYPE_TO_IDX[sde_type]
+        RV[i] = np.std(ctx) * np.sqrt(365)
 
-    return torch.from_numpy(X), torch.from_numpy(H), torch.from_numpy(Y_branches)
+    return (torch.from_numpy(X), torch.from_numpy(H), torch.from_numpy(Y_branches),
+            torch.from_numpy(SDE_idx), torch.from_numpy(RV))
