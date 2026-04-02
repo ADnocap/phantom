@@ -27,7 +27,7 @@ apptainer exec --nv --writable-tmpfs \
   --bind $WORKDIR:$WORKDIR:rw \
   --bind $WORKDIR/mytmp:/tmp \
   $WORKDIR/unsloth.sif \
-  bash -c "pip install -q ccxt && python train_finetune.py \
+  python train_finetune.py \
     --pretrained checkpoints/best.pt \
     --btc_cache data/btc_daily.npz \
     --val_start 2022-01-01 \
@@ -50,4 +50,4 @@ apptainer exec --nv --writable-tmpfs \
     --val_every 500 \
     --save_every 1000 \
     --log_every 50 \
-    --seed 42"
+    --seed 42

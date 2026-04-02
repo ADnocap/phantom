@@ -11,10 +11,13 @@ from datetime import datetime
 
 import numpy as np
 
-try:
-    import ccxt
-except ImportError:
-    raise ImportError("Install ccxt: pip install ccxt")
+
+def _load_ccxt():
+    try:
+        import ccxt
+        return ccxt
+    except ImportError:
+        raise ImportError("Install ccxt: pip install ccxt")
 
 
 def _fetch_all_ohlcv(exchange, symbol, timeframe, since_ms, until_ms=None):
@@ -71,6 +74,7 @@ def fetch_btc_daily(
     cache.parent.mkdir(parents=True, exist_ok=True)
 
     # ── Bitstamp: 2015 to 2017-08-16 ──
+    ccxt = _load_ccxt()
     print("Fetching Bitstamp BTC/USD (2015 to 2017-08-16)...")
     bitstamp = ccxt.bitstamp()
     since_bs = bitstamp.parse8601(f"{start_date}T00:00:00Z")

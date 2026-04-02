@@ -45,7 +45,7 @@ def main():
 
     # ── Generate test data with branches ──
     print("Generating test set (8192 samples, 128 branches)...")
-    test_x, test_h, test_yb = make_validation_batch(
+    test_x, test_h, test_yb, _, _ = make_validation_batch(
         n_samples=8192, context_len=cfg.context_len, n_branches=128, seed=7777)
 
     # Use a random branch per sample as the "true" scalar y (for CRPS/PIT/coverage)
