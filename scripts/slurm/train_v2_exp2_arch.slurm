@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=phantom-v2
+#SBATCH --job-name=ph-exp2
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpua100
@@ -7,22 +7,17 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --mem-per-cpu=12G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/train_v2_%j.out
-#SBATCH --error=logs/train_v2_%j.err
+#SBATCH --output=logs/exp2_%j.out
+#SBATCH --error=logs/exp2_%j.err
 
-# ─── Phantom v2: All improvements ─────────────────────────────────
-# - Student-t mixture head (heavy tails)
-# - Gumbel-Softmax energy distance (differentiable pi gradients)
-# - Auxiliary quantile loss (calibration pressure)
-# - Multi-scale patching [3, 5, 15] (multi-resolution)
-# - Trailing realized vol features (4 input channels)
-# - Series decomposition (trend-residual separation)
-# - SDE v2 families (+ MRW, Fractional OU)
+# ─── Exp 2: Architecture only — multi-scale + decomp + vol features ──
+# Gaussian head (no Student-t), no Gumbel, no quantile, v1 SDEs
+# Tests: do the architecture improvements work in isolation?
 
 WORKDIR=/gpfs/workdir/dalbanal
 PROJECT=$WORKDIR/phantom
 cd $PROJECT
-mkdir -p logs checkpoints_v2
+mkdir -p logs checkpoints_exp2 logs/exp2
 
 module load apptainer/1.4.4/gcc-15.1.0
 
@@ -54,19 +49,16 @@ apptainer exec --nv --writable-tmpfs \
     --grad_clip 1.0 \
     --n_model_samples 256 \
     --nll_weight 0.1 \
-    --aux_weight 0.15 \
+    --aux_weight 0.5 \
     --n_workers 8 \
     --val_every 2000 \
     --save_every 5000 \
     --log_every 100 \
     --val_samples 2048 \
     --seed 42 \
-    --checkpoint_dir checkpoints_v2 \
-    --log_dir logs/pretrain_v2 \
-    --use_student_t \
-    --use_gumbel_softmax \
-    --quantile_weight 0.2 \
+    --checkpoint_dir checkpoints_exp2 \
+    --log_dir logs/exp2 \
     --patch_sizes 3 5 15 \
     --n_input_channels 4 \
     --use_decomposition \
-    --sde_version v2"
+    --sde_version v1"

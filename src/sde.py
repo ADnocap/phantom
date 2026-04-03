@@ -513,9 +513,12 @@ def _sim_frac_ou_daily(mu, sigma, theta, kappa_vol, xi_vol, H, n_days, rng=None)
     dt_day = 1.0 / 365
 
     # Generate fBM increments for the price process
+    # fGn from Davies-Harte has unit variance; scale to daily vol = sigma * sqrt(dt)
     fbm_increments = _generate_fbm_increments(n_days, H, rng)
-    # Scale to daily
-    fbm_increments = fbm_increments * np.sqrt(dt_day) ** (2 * H)
+    # Normalize to unit variance (fGn variance depends on H, normalize empirically)
+    inc_std = np.std(fbm_increments)
+    if inc_std > 1e-12:
+        fbm_increments = fbm_increments / inc_std
 
     # Simulate stochastic log-vol (standard OU with BM, not fBM)
     log_vol = np.zeros(n_days)
@@ -527,9 +530,10 @@ def _sim_frac_ou_daily(mu, sigma, theta, kappa_vol, xi_vol, H, n_days, rng=None)
         log_vol[t] = log_vol[t - 1] + kappa_vol * (log_sigma_base - log_vol[t - 1]) * dt_day + xi_vol * dW
 
     sigma_t = np.exp(log_vol)  # (n_days,) instantaneous annualized vol
+    daily_vol = sigma_t * np.sqrt(dt_day)  # convert annualized to daily
 
     # Combine: returns with fractional noise and stochastic vol
-    returns = mu * dt_day + sigma_t * fbm_increments
+    returns = mu * dt_day + daily_vol * fbm_increments
 
     return returns.astype(np.float32)
 

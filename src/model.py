@@ -71,6 +71,9 @@ class PhantomConfig:
     use_decomposition: bool = False
     decomp_kernel: int = 5
 
+    # FiLM conditioning (multiplicative, cannot be bypassed via residual)
+    use_film: bool = False
+
     @property
     def n_patches(self) -> int:
         if self.patch_sizes is not None:
@@ -202,6 +205,68 @@ class CrossAttentionDecoderLayer(nn.Module):
         return query
 
 
+# ── FiLM Decoder Layer ─────────────────────────────────────────────
+
+class FiLMDecoderLayer(nn.Module):
+    """FiLM-conditioned decoder: multiplicative conditioning that cannot be bypassed.
+
+    Instead of cross-attention (additive residual, easy to ignore),
+    FiLM modulates features via: output = gamma(condition) * input + beta(condition).
+    If gamma=0, the feature is killed — the model MUST use the condition.
+    """
+
+    def __init__(self, cfg: PhantomConfig):
+        super().__init__()
+        # Pool encoder output to a conditioning vector
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+        # FiLM: encoder → (gamma, beta) for modulating the query
+        self.film = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_ff),
+            nn.GELU(),
+            nn.Linear(cfg.d_ff, 2 * cfg.d_model),
+        )
+
+        # Also keep cross-attention for information routing
+        self.cross_attn = nn.MultiheadAttention(
+            cfg.d_model, cfg.n_heads, dropout=cfg.dropout, batch_first=True)
+
+        self.ff = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_ff),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_ff, cfg.d_model),
+        )
+        self.norm1 = nn.LayerNorm(cfg.d_model)
+        self.norm2 = nn.LayerNorm(cfg.d_model)
+        self.norm3 = nn.LayerNorm(cfg.d_model)
+        self.dropout1 = nn.Dropout(cfg.dropout)
+        self.dropout2 = nn.Dropout(cfg.dropout)
+
+    def forward(self, query: torch.Tensor, encoder_out: torch.Tensor):
+        # FiLM conditioning: modulate query multiplicatively
+        enc_pooled = self.pool(encoder_out.transpose(1, 2)).squeeze(-1)  # (B, d)
+        film_params = self.film(enc_pooled)  # (B, 2*d)
+        gamma, beta = film_params.chunk(2, dim=-1)  # each (B, d)
+        gamma = gamma.unsqueeze(1)  # (B, 1, d)
+        beta = beta.unsqueeze(1)    # (B, 1, d)
+
+        # Apply FiLM: multiplicative modulation (cannot be bypassed)
+        query = self.norm1(query)
+        query = gamma * query + beta
+
+        # Cross-attention (additional, but FiLM already injected the signal)
+        q_norm = self.norm2(query)
+        attn_out, _ = self.cross_attn(q_norm, encoder_out, encoder_out)
+        query = query + self.dropout1(attn_out)
+
+        # FFN
+        ff_out = self.ff(self.norm3(query))
+        query = query + self.dropout2(ff_out)
+
+        return query
+
+
 # ── Mixture Forecast Head ──────────────────────────────────────────
 
 class MixtureHead(nn.Module):
@@ -307,11 +372,16 @@ class PhantomModel(nn.Module):
                 for _ in range(cfg.n_layers)
             ])
 
-        # Cross-attention decoder
+        # Decoder (cross-attention or FiLM-conditioned)
         self.horizon_embed = nn.Embedding(max(cfg.horizons) + 1, cfg.d_model)
-        self.decoder_layers = nn.ModuleList([
-            CrossAttentionDecoderLayer(cfg) for _ in range(cfg.n_decoder_layers)
-        ])
+        if cfg.use_film:
+            self.decoder_layers = nn.ModuleList([
+                FiLMDecoderLayer(cfg) for _ in range(cfg.n_decoder_layers)
+            ])
+        else:
+            self.decoder_layers = nn.ModuleList([
+                CrossAttentionDecoderLayer(cfg) for _ in range(cfg.n_decoder_layers)
+            ])
         self.decoder_norm = nn.LayerNorm(cfg.d_model)
 
         # Mixture forecast head

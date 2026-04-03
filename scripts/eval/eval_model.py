@@ -46,8 +46,16 @@ sample_mog = sample_mixture_np
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/best.pt')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output plot path (auto-generated if not set)')
+    parser.add_argument('--n_test', type=int, default=8192)
+    args = parser.parse_args()
+
     # ── Load model ──
-    ckpt = torch.load('checkpoints/best.pt', map_location='cpu', weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     cfg_dict = ckpt['config']
     cfg = PhantomConfig(**{k: v for k, v in cfg_dict.items() if k in PhantomConfig.__dataclass_fields__})
     model = PhantomModel(cfg)
@@ -59,9 +67,9 @@ def main():
     # ── Generate test data with branches ──
     n_channels = getattr(cfg, 'n_input_channels', 1)
     sde_ver = 'v2' if getattr(cfg, 'n_sde_types', 5) > 5 else 'v1'
-    print("Generating test set (8192 samples, 128 branches)...")
+    print(f"Generating test set ({args.n_test} samples, 128 branches)...")
     test_x, test_h, test_yb, _, _ = make_validation_batch(
-        n_samples=8192, context_len=cfg.context_len, n_branches=128, seed=7777,
+        n_samples=args.n_test, context_len=cfg.context_len, n_branches=128, seed=7777,
         n_input_channels=n_channels, sde_version=sde_ver)
 
     # Use a random branch per sample as the "true" scalar y (for CRPS/PIT/coverage)
@@ -230,8 +238,9 @@ def main():
         f"Phantom JointFM Eval -- best.pt (step {ckpt['step']:,}, ED={ed.item():.4f}, CRPS={crps_model:.4f})",
         fontsize=15, y=0.99,
     )
-    plt.savefig('plots/pretrain_eval.png', dpi=150, bbox_inches='tight')
-    print("\nSaved model_eval.png")
+    out_path = args.output or f'plots/pretrain_eval_{ckpt["step"]}.png'
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    print(f"\nSaved {out_path}")
 
 
 if __name__ == "__main__":

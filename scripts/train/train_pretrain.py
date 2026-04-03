@@ -232,6 +232,20 @@ def parse_args():
     p.add_argument('--sde_version', type=str, default='v1', choices=['v1', 'v2'],
                    help='SDE family version (v2 adds MRW + Fractional OU)')
 
+    # ── Phase 6: conditional signal fixes ──
+    p.add_argument('--use_crps_avg', action='store_true', default=False,
+                   help='Use CRPS-avg over branches instead of ED (zero noise)')
+    p.add_argument('--use_film', action='store_true', default=False,
+                   help='Use FiLM conditioning (multiplicative, prevents bypass)')
+    p.add_argument('--contrastive_weight', type=float, default=0.0,
+                   help='Weight for InfoNCE contrastive loss (0 = disabled)')
+    p.add_argument('--enc_var_weight', type=float, default=0.0,
+                   help='Weight for encoder variance penalty (0 = disabled)')
+    p.add_argument('--mean_match_weight', type=float, default=0.0,
+                   help='Weight for mean matching loss (0 = disabled)')
+    p.add_argument('--var_match_weight', type=float, default=0.0,
+                   help='Weight for variance matching loss (0 = disabled)')
+
     return p.parse_args()
 
 
@@ -266,6 +280,7 @@ def main():
         n_input_channels=args.n_input_channels,
         use_decomposition=args.use_decomposition,
         decomp_kernel=args.decomp_kernel,
+        use_film=args.use_film,
     )
 
     model = PhantomModel(cfg).to(device)
@@ -379,15 +394,27 @@ def main():
             rv_labels = rv_labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                # Main loss: energy distance + aux NLL (+ optional quantile)
-                log_pi, mu, sigma, nu = model(x, h)
-                loss_main, ed, nll = combined_loss(
+                # Encode (needed for contrastive/variance losses)
+                enc_out = model.encode(x)
+
+                # Condition dropout
+                if model.training and model.cfg.cond_drop_prob > 0:
+                    mask = torch.rand(x.size(0), 1, 1, device=enc_out.device) > model.cfg.cond_drop_prob
+                    enc_out_masked = enc_out * mask
+                else:
+                    enc_out_masked = enc_out
+
+                log_pi, mu, sigma, nu = model.decode(enc_out_masked, h)
+
+                # Main loss: ED or CRPS-avg + NLL (+ optional quantile)
+                loss_main, primary, nll = combined_loss(
                     log_pi, mu, sigma, yb,
                     n_model_samples=args.n_model_samples,
                     nll_weight=args.nll_weight,
                     nu=nu,
                     use_gumbel_softmax=args.use_gumbel_softmax,
                     quantile_weight=args.quantile_weight,
+                    use_crps_avg=args.use_crps_avg,
                 )
 
                 # Auxiliary losses: SDE classification + vol regression
@@ -397,6 +424,28 @@ def main():
                 loss_aux = loss_sde + loss_vol
 
                 loss = loss_main + args.aux_weight * loss_aux
+
+                # Contrastive loss (InfoNCE)
+                if args.contrastive_weight > 0:
+                    from src.losses import contrastive_loss
+                    loss_contr = contrastive_loss(enc_out, yb)
+                    loss = loss + args.contrastive_weight * loss_contr
+
+                # Encoder variance penalty
+                if args.enc_var_weight > 0:
+                    from src.losses import encoder_variance_penalty
+                    loss_evar = encoder_variance_penalty(enc_out)
+                    loss = loss + args.enc_var_weight * loss_evar
+
+                # Moment matching losses
+                if args.mean_match_weight > 0 or args.var_match_weight > 0:
+                    from src.losses import moment_matching_loss
+                    mean_loss, var_loss = moment_matching_loss(log_pi, mu, sigma, yb, nu)
+                    if args.mean_match_weight > 0:
+                        loss = loss + args.mean_match_weight * mean_loss
+                    if args.var_match_weight > 0:
+                        loss = loss + args.var_match_weight * var_loss
+
                 loss = loss / args.grad_accum
 
             if scaler is not None:
@@ -426,7 +475,7 @@ def main():
             run['loss'] += loss.item() * args.grad_accum
             run['loss_main'] += loss_main.item()
             run['loss_aux'] += loss_aux.item()
-            run['ed'] += ed.item()
+            run['ed'] += primary.item()
             run['nll'] += nll.item()
             run['loss_sde'] += loss_sde.item()
             run['vol_mse'] += loss_vol.item()

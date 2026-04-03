@@ -3,6 +3,7 @@ from .generator import generate_shard, generate_dataset
 from .model import PhantomConfig, PhantomModel, MixtureHead, MoGHead
 from .losses import (
     nll_loss, crps_loss, energy_distance_loss, combined_loss,
-    quantile_loss, mixture_cdf,
+    quantile_loss, mixture_cdf, crps_avg_loss,
+    contrastive_loss, encoder_variance_penalty,
 )
 from .data import ShardDataset, OnlineDataset, make_validation_batch

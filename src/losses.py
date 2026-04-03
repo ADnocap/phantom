@@ -376,6 +376,156 @@ def quantile_loss(
     return total / len(levels)
 
 
+# ── CRPS-avg Loss (closed-form over all branches) ────────────────
+
+def crps_avg_loss(
+    log_pi: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    y_branches: torch.Tensor,
+    nu: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Average closed-form CRPS over all branched futures.
+
+    Unlike sample-based ED, this has ZERO estimator noise because:
+    - CRPS for Gaussian MoG is closed-form (no model sampling)
+    - We evaluate against each branch individually (no Y-Y' term)
+
+    Args:
+        log_pi:     (B, K) log mixture weights.
+        mu:         (B, K) component means.
+        sigma:      (B, K) component stds.
+        y_branches: (B, N) ground-truth branched future returns.
+        nu:         (B, K) degrees of freedom (None for Gaussian).
+
+    Returns:
+        Scalar mean CRPS over batch and branches.
+    """
+    B, N = y_branches.shape
+    total = torch.zeros(1, device=mu.device, dtype=mu.dtype)
+
+    # Compute CRPS for each branch and average
+    for j in range(N):
+        total = total + crps_loss(log_pi, mu, sigma, y_branches[:, j], nu=nu)
+
+    return total / N
+
+
+# ── Contrastive Loss (InfoNCE) ───────────────────────────────────
+
+def contrastive_loss(
+    enc_out: torch.Tensor,
+    y_branches: torch.Tensor,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    """InfoNCE contrastive loss: maximize MI between encoder output and branches.
+
+    Scores (enc_i, y_branches_i) higher than (enc_i, y_branches_j) for j != i.
+    This directly penalizes the model when different inputs produce similar
+    encoder representations, attacking the marginal collapse problem.
+
+    Args:
+        enc_out:    (B, N_patches, d_model) encoder output.
+        y_branches: (B, N_branches) ground-truth branched futures.
+        temperature: InfoNCE temperature.
+
+    Returns:
+        Scalar contrastive loss.
+    """
+    B = enc_out.size(0)
+    if B < 2:
+        return torch.zeros(1, device=enc_out.device)
+
+    # Pool encoder output to (B, d_model)
+    enc_pooled = enc_out.mean(dim=1)  # (B, d)
+
+    # Project branches to a summary vector (B, d_branch)
+    # Use mean + std as branch summary (captures location and spread)
+    branch_mean = y_branches.mean(dim=1, keepdim=True)  # (B, 1)
+    branch_std = y_branches.std(dim=1, keepdim=True)    # (B, 1)
+    branch_summary = torch.cat([branch_mean, branch_std], dim=1)  # (B, 2)
+
+    # Simple bilinear score: project both to same dimension
+    # Use a linear projection of enc_pooled to 2 dims
+    d = enc_pooled.size(1)
+    # Learned projection not needed — use cosine similarity after projection
+    # For simplicity, project enc to 2D via the first 2 dims of the mean
+    enc_proj = enc_pooled[:, :2]  # (B, 2) — crude but effective
+
+    # Normalize
+    enc_proj = F.normalize(enc_proj, dim=1)
+    branch_summary = F.normalize(branch_summary, dim=1)
+
+    # Similarity matrix (B, B)
+    logits = torch.mm(enc_proj, branch_summary.t()) / temperature  # (B, B)
+
+    # InfoNCE: positive pairs are on the diagonal
+    labels = torch.arange(B, device=logits.device)
+    return F.cross_entropy(logits, labels)
+
+
+# ── Encoder Variance Penalty ─────────────────────────────────────
+
+def encoder_variance_penalty(enc_out: torch.Tensor) -> torch.Tensor:
+    """Penalize low variance in encoder output across the batch.
+
+    Prevents the encoder from outputting near-constant representations,
+    which is a prerequisite for conditional predictions.
+
+    Args:
+        enc_out: (B, N_patches, d_model) encoder output.
+
+    Returns:
+        Scalar penalty (higher = more uniform encoder output = bad).
+    """
+    # Pool to (B, d)
+    enc_pooled = enc_out.mean(dim=1)
+    # Variance across batch for each feature dimension
+    var_per_dim = enc_pooled.var(dim=0)  # (d,)
+    # Return negative mean variance (minimize this = maximize variance)
+    return -var_per_dim.mean()
+
+
+# ── Moment Matching Losses ────────────────────────────────────────
+
+def moment_matching_loss(
+    log_pi: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    y_branches: torch.Tensor,
+    nu: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean and variance matching against branched futures.
+
+    Directly supervises the predicted mean and variance to match the
+    empirical moments of the 128 MC branches. Zero estimator noise.
+
+    Args:
+        log_pi:     (B, K) log mixture weights.
+        mu:         (B, K) component means.
+        sigma:      (B, K) component scales.
+        y_branches: (B, N) ground-truth branched future returns.
+        nu:         (B, K) degrees of freedom (unused, for API consistency).
+
+    Returns:
+        (mean_loss, var_loss) — both scalars.
+    """
+    pi = log_pi.exp()  # (B, K)
+
+    # Predicted moments from mixture
+    pred_mean = (pi * mu).sum(dim=-1)                                    # (B,)
+    pred_var = (pi * (sigma**2 + mu**2)).sum(dim=-1) - pred_mean**2      # (B,)
+
+    # Target moments from branches (128 samples → very stable estimates)
+    target_mean = y_branches.mean(dim=-1)   # (B,)
+    target_var = y_branches.var(dim=-1)     # (B,)
+
+    mean_loss = F.mse_loss(pred_mean, target_mean)
+    var_loss = F.mse_loss(pred_var, target_var)
+
+    return mean_loss, var_loss
+
+
 # ── Combined Loss ─────────────────────────────────────────────────
 
 def combined_loss(
@@ -389,8 +539,11 @@ def combined_loss(
     use_gumbel_softmax: bool = False,
     gumbel_tau: float = 0.5,
     quantile_weight: float = 0.0,
+    use_crps_avg: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Combined training loss: Energy Distance + auxiliary NLL + optional quantile.
+    """Combined training loss.
+
+    Primary loss is either Energy Distance or CRPS-avg over branches.
 
     Args:
         log_pi:     (B, K) log mixture weights.
@@ -403,25 +556,29 @@ def combined_loss(
         use_gumbel_softmax: Use Gumbel-Softmax in energy distance.
         gumbel_tau: Temperature for Gumbel-Softmax.
         quantile_weight: weight for auxiliary quantile loss (0 = disabled).
+        use_crps_avg: Use CRPS-avg instead of ED as primary loss.
 
     Returns:
-        (total_loss, energy_dist, nll_term) — all scalars.
+        (total_loss, primary_loss, nll_term) — all scalars.
     """
-    ed = energy_distance_loss(log_pi, mu, sigma, y_branches,
-                              n_model_samples, nu,
-                              use_gumbel_softmax, gumbel_tau)
+    if use_crps_avg:
+        primary = crps_avg_loss(log_pi, mu, sigma, y_branches, nu)
+    else:
+        primary = energy_distance_loss(log_pi, mu, sigma, y_branches,
+                                       n_model_samples, nu,
+                                       use_gumbel_softmax, gumbel_tau)
 
-    # NLL on a random branch per sample (for pi gradient flow)
+    # NLL on a random branch per sample
     B, N = y_branches.shape
     rand_idx = torch.randint(N, (B,), device=y_branches.device)
     y_single = y_branches[torch.arange(B, device=y_branches.device), rand_idx]
     nll = nll_loss(log_pi, mu, sigma, y_single, nu)
 
-    total = ed + nll_weight * nll
+    total = primary + nll_weight * nll
 
     # Optional quantile loss on the same random branch
     if quantile_weight > 0:
         ql = quantile_loss(log_pi, mu, sigma, y_single, nu)
         total = total + quantile_weight * ql
 
-    return total, ed, nll
+    return total, primary, nll

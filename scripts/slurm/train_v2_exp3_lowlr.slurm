@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=phantom-v2
+#SBATCH --job-name=ph-exp3
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpua100
@@ -7,22 +7,17 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --mem-per-cpu=12G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/train_v2_%j.out
-#SBATCH --error=logs/train_v2_%j.err
+#SBATCH --output=logs/exp3_%j.out
+#SBATCH --error=logs/exp3_%j.err
 
-# ─── Phantom v2: All improvements ─────────────────────────────────
-# - Student-t mixture head (heavy tails)
-# - Gumbel-Softmax energy distance (differentiable pi gradients)
-# - Auxiliary quantile loss (calibration pressure)
-# - Multi-scale patching [3, 5, 15] (multi-resolution)
-# - Trailing realized vol features (4 input channels)
-# - Series decomposition (trend-residual separation)
-# - SDE v2 families (+ MRW, Fractional OU)
+# ─── Exp 3: Full v2 + lower LR (1e-4) + longer warmup ──────────
+# All improvements enabled, but gentler optimization
+# Tests: is the complex model just overshoting with high LR?
 
 WORKDIR=/gpfs/workdir/dalbanal
 PROJECT=$WORKDIR/phantom
 cd $PROJECT
-mkdir -p logs checkpoints_v2
+mkdir -p logs checkpoints_exp3 logs/exp3
 
 module load apptainer/1.4.4/gcc-15.1.0
 
@@ -47,9 +42,9 @@ apptainer exec --nv --writable-tmpfs \
     --dropout 0.2 \
     --epochs 30 \
     --batch_size 256 \
-    --lr 3e-4 \
+    --lr 1e-4 \
     --min_lr 1e-6 \
-    --warmup_steps 2000 \
+    --warmup_steps 4000 \
     --weight_decay 0.01 \
     --grad_clip 1.0 \
     --n_model_samples 256 \
@@ -61,8 +56,8 @@ apptainer exec --nv --writable-tmpfs \
     --log_every 100 \
     --val_samples 2048 \
     --seed 42 \
-    --checkpoint_dir checkpoints_v2 \
-    --log_dir logs/pretrain_v2 \
+    --checkpoint_dir checkpoints_exp3 \
+    --log_dir logs/exp3 \
     --use_student_t \
     --use_gumbel_softmax \
     --quantile_weight 0.2 \
