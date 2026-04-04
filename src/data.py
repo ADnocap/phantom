@@ -31,6 +31,12 @@ SDE_TYPES_V2 = SDE_TYPES + ['mrw', 'frac_ou']
 SDE_TYPE_TO_IDX_V2 = {t: i for i, t in enumerate(SDE_TYPES_V2)}
 SDE_WEIGHTS_V2 = [0.04, 0.12, 0.22, 0.22, 0.15, 0.15, 0.10]
 
+# v3: heavy weight on non-Markovian SDEs (context carries predictive signal)
+SDE_TYPES_V3 = SDE_TYPES + ['garch', 'momentum']
+SDE_TYPE_TO_IDX_V3 = {t: i for i, t in enumerate(SDE_TYPES_V3)}
+# 50% non-Markovian (GARCH + momentum), 30% regime-switching, 20% stationary
+SDE_WEIGHTS_V3 = [0.02, 0.05, 0.05, 0.08, 0.30, 0.30, 0.20]
+
 HORIZONS = np.array([3, 5, 7])
 
 
@@ -80,6 +86,8 @@ def _build_input(ctx: np.ndarray, n_input_channels: int) -> np.ndarray:
 
 def _get_sde_config(sde_version: str):
     """Return (types, type_to_idx, weights) for the given SDE version."""
+    if sde_version == 'v3':
+        return SDE_TYPES_V3, SDE_TYPE_TO_IDX_V3, SDE_WEIGHTS_V3
     if sde_version == 'v2':
         return SDE_TYPES_V2, SDE_TYPE_TO_IDX_V2, SDE_WEIGHTS_V2
     return SDE_TYPES, SDE_TYPE_TO_IDX, SDE_WEIGHTS

@@ -74,6 +74,9 @@ class PhantomConfig:
     # FiLM conditioning (multiplicative, cannot be bypassed via residual)
     use_film: bool = False
 
+    # Head type: 'mog' (mixture of Gaussians), 'mot' (mixture of Student-t), 'student_t' (single)
+    head_type: str = 'mog'
+
     @property
     def n_patches(self) -> int:
         if self.patch_sizes is not None:
@@ -316,6 +319,46 @@ class MixtureHead(nn.Module):
 MoGHead = MixtureHead
 
 
+# ── Single Student-t Head ─────────────────────────────────────────
+
+class StudentTHead(nn.Module):
+    """Single Student-t distribution head: 3 parameters (mu, sigma, nu).
+
+    Outputs a single Student-t distribution per sample — no mixture.
+    This is what Lag-Llama and GluonTS/DeepAR use.
+
+    Returns (log_pi, mu, sigma, nu) where log_pi = zeros (single component)
+    for API compatibility with MixtureHead.
+    """
+
+    def __init__(self, cfg: PhantomConfig):
+        super().__init__()
+        self.log_sigma_min = cfg.log_sigma_min
+        self.log_sigma_max = cfg.log_sigma_max
+        self.log_nu_min = cfg.log_nu_min
+        self.log_nu_max = cfg.log_nu_max
+
+        self.net = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.head_hidden),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.head_hidden, 3),  # mu, log_sigma, log_nu
+        )
+
+    def forward(self, z: torch.Tensor):
+        out = self.net(z)  # (B, 3)
+        mu = out[:, 0:1]   # (B, 1)
+        log_sigma = out[:, 1:2].clamp(self.log_sigma_min, self.log_sigma_max)
+        sigma = log_sigma.exp()  # (B, 1)
+        log_nu = out[:, 2:3].clamp(self.log_nu_min, self.log_nu_max)
+        nu = log_nu.exp()        # (B, 1)
+
+        # log_pi = 0 (single component with weight 1)
+        log_pi = torch.zeros_like(mu)  # (B, 1)
+
+        return log_pi, mu, sigma, nu
+
+
 # ── Full Model ──────────────────────────────────────────────────────
 
 class PhantomModel(nn.Module):
@@ -384,8 +427,12 @@ class PhantomModel(nn.Module):
             ])
         self.decoder_norm = nn.LayerNorm(cfg.d_model)
 
-        # Mixture forecast head
-        self.head = MixtureHead(cfg)
+        # Forecast head
+        if cfg.head_type == 'student_t':
+            self.head = StudentTHead(cfg)
+        else:
+            # 'mog' or 'mot' — handled by MixtureHead via use_student_t flag
+            self.head = MixtureHead(cfg)
 
         # Auxiliary heads
         self.aux_pool = nn.AdaptiveAvgPool1d(1)

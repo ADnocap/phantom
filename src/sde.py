@@ -538,6 +538,124 @@ def _sim_frac_ou_daily(mu, sigma, theta, kappa_vol, xi_vol, H, n_days, rng=None)
     return returns.astype(np.float32)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# v3 SDE simulators: NON-MARKOVIAN dynamics (context carries signal)
+# ═══════════════════════════════════════════════════════════════════
+
+def _sim_garch_daily(mu, omega, alpha, beta, n_days, rng=None):
+    """Simulate GARCH(1,1) and return daily log-returns.
+
+    r_t = mu*dt + sigma_t * z_t
+    sigma_t^2 = omega + alpha * r_{t-1}^2 + beta * sigma_{t-1}^2
+
+    Key property: volatility clustering — recent high vol predicts future high vol.
+    The context history IS predictive of the future because sigma_t depends on
+    the ENTIRE past sequence of returns, not just the current state.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    dt_day = 1.0 / 365
+    returns = np.zeros(n_days, dtype=np.float64)
+
+    # Initialize variance at unconditional level: omega / (1 - alpha - beta)
+    persistence = alpha + beta
+    if persistence < 1.0:
+        var_uncond = omega / (1.0 - persistence)
+    else:
+        var_uncond = omega / 0.01  # fallback
+    sigma2 = var_uncond
+
+    for t in range(n_days):
+        sigma_t = np.sqrt(max(sigma2, 1e-10))
+        z = rng.standard_normal()
+        r = mu * dt_day + sigma_t * z
+        returns[t] = r
+        # Update variance
+        sigma2 = omega + alpha * r * r + beta * sigma2
+
+    return returns.astype(np.float32), sigma2
+
+
+def _sim_momentum_daily(mu, sigma, phi, n_days, rng=None):
+    """Simulate returns with momentum/mean-reversion autocorrelation.
+
+    r_t = (mu + phi * r_{t-1}) * dt_scale + sigma * sqrt(dt) * z_t
+
+    phi > 0: momentum (positive returns predict positive returns)
+    phi < 0: mean reversion (positive returns predict negative returns)
+
+    Key property: the context's recent returns ARE predictive of future returns.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    dt_day = 1.0 / 365
+    returns = np.zeros(n_days, dtype=np.float64)
+    daily_vol = sigma * np.sqrt(dt_day)
+
+    r_prev = 0.0
+    for t in range(n_days):
+        drift = mu * dt_day + phi * r_prev
+        z = rng.standard_normal()
+        r = drift + daily_vol * z
+        returns[t] = r
+        r_prev = r
+
+    return returns.astype(np.float32), r_prev
+
+
+def _sim_garch_with_state(mu, omega, alpha, beta, n_days, rng=None):
+    returns, sigma2_terminal = _sim_garch_daily(mu, omega, alpha, beta, n_days, rng)
+    log_S = float(np.sum(returns))
+    return returns, log_S, sigma2_terminal
+
+
+def _sim_momentum_with_state(mu, sigma, phi, n_days, rng=None):
+    returns, r_prev = _sim_momentum_daily(mu, sigma, phi, n_days, rng)
+    log_S = float(np.sum(returns))
+    return returns, log_S, r_prev
+
+
+def _sim_garch_forward_batch(mu, omega, alpha, beta, log_S0, sigma2_0, n_days, n_branches, rng=None):
+    """Branch GARCH paths from terminal state (sigma2_0)."""
+    if rng is None:
+        rng = np.random.default_rng()
+    dt_day = 1.0 / 365
+    results = np.empty(n_branches, dtype=np.float32)
+    for b in range(n_branches):
+        log_S = log_S0
+        sigma2 = sigma2_0
+        for t in range(n_days):
+            sigma_t = np.sqrt(max(sigma2, 1e-10))
+            z = rng.standard_normal()
+            r = mu * dt_day + sigma_t * z
+            log_S += r
+            sigma2 = omega + alpha * r * r + beta * sigma2
+        results[b] = log_S - log_S0
+    return results
+
+
+def _sim_momentum_forward_batch(mu, sigma, phi, log_S0, r_prev0, n_days, n_branches, rng=None):
+    """Branch momentum paths from terminal state (r_prev)."""
+    if rng is None:
+        rng = np.random.default_rng()
+    dt_day = 1.0 / 365
+    daily_vol = sigma * np.sqrt(dt_day)
+    results = np.empty(n_branches, dtype=np.float32)
+    for b in range(n_branches):
+        log_S = log_S0
+        r_prev = r_prev0
+        for t in range(n_days):
+            drift = mu * dt_day + phi * r_prev
+            z = rng.standard_normal()
+            r = drift + daily_vol * z
+            log_S += r
+            r_prev = r
+        results[b] = log_S - log_S0
+    return results
+
+
 # ── v2 with-state and forward-batch variants ───────────────────────
 
 def _sim_mrw_with_state(mu, sigma, lam_param, T_days, n_days, rng=None):
@@ -650,6 +768,24 @@ def simulate_context_and_branches(sde_type, params, context_days, horizon_days, 
             params['Q'], params['n_regimes'],
             log_S, regime_term, horizon_days, n_branches)
 
+    elif sde_type == 'garch':
+        rng = params.get('_rng', None)
+        ctx, log_S, sigma2_term = _sim_garch_with_state(
+            params['mu'], params['omega'], params['alpha'], params['beta'],
+            context_days, rng)
+        branches = _sim_garch_forward_batch(
+            params['mu'], params['omega'], params['alpha'], params['beta'],
+            log_S, sigma2_term, horizon_days, n_branches, rng)
+
+    elif sde_type == 'momentum':
+        rng = params.get('_rng', None)
+        ctx, log_S, r_prev = _sim_momentum_with_state(
+            params['mu'], params['sigma'], params['phi'],
+            context_days, rng)
+        branches = _sim_momentum_forward_batch(
+            params['mu'], params['sigma'], params['phi'],
+            log_S, r_prev, horizon_days, n_branches, rng)
+
     elif sde_type == 'mrw':
         rng = params.get('_rng', None)
         ctx, log_S = _sim_mrw_with_state(
@@ -750,6 +886,37 @@ def sample_params(sde_type, rng=None):
             'Q': Q, 'n_regimes': n_regimes,
         }
 
+    elif sde_type == 'garch':
+        # GARCH(1,1): omega + alpha*r^2 + beta*sigma^2
+        # Constraint: alpha + beta < 1 for stationarity
+        alpha = rng.uniform(0.03, 0.15)
+        beta = rng.uniform(0.75, 0.95)
+        # Clip to ensure stationarity
+        if alpha + beta >= 0.999:
+            beta = 0.999 - alpha
+        # omega = unconditional_var * (1 - alpha - beta)
+        # unconditional daily var ~ (sigma_annual / sqrt(365))^2
+        uncond_daily_var = (sigma / np.sqrt(365)) ** 2
+        omega = uncond_daily_var * (1.0 - alpha - beta)
+        return {
+            'mu': mu,
+            'omega': omega,
+            'alpha': alpha,
+            'beta': beta,
+            '_rng': rng,
+        }
+
+    elif sde_type == 'momentum':
+        # phi > 0: momentum, phi < 0: mean reversion
+        # Typical autocorrelation in crypto: weak momentum or mean reversion
+        phi = rng.uniform(-0.3, 0.3)
+        return {
+            'mu': mu,
+            'sigma': sigma,
+            'phi': phi,
+            '_rng': rng,
+        }
+
     elif sde_type == 'mrw':
         return {
             'mu': mu,
@@ -824,6 +991,20 @@ def simulate_daily_returns(sde_type, params, n_days):
             params['Q'], params['n_regimes'],
             n_days,
         )
+
+    elif sde_type == 'garch':
+        rng = params.get('_rng', None)
+        returns, _ = _sim_garch_daily(
+            params['mu'], params['omega'], params['alpha'], params['beta'],
+            n_days, rng)
+        return returns
+
+    elif sde_type == 'momentum':
+        rng = params.get('_rng', None)
+        returns, _ = _sim_momentum_daily(
+            params['mu'], params['sigma'], params['phi'],
+            n_days, rng)
+        return returns
 
     elif sde_type == 'mrw':
         rng = params.get('_rng', None)

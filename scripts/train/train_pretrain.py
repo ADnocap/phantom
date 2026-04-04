@@ -217,6 +217,9 @@ def parse_args():
     # ── v2 flags ──
     p.add_argument('--use_student_t', action='store_true', default=False,
                    help='Use Student-t mixture head instead of Gaussian')
+    p.add_argument('--head_type', type=str, default='mog',
+                   choices=['mog', 'mot', 'student_t'],
+                   help='Head type: mog (Gaussian mix), mot (Student-t mix), student_t (single)')
     p.add_argument('--use_gumbel_softmax', action='store_true', default=False,
                    help='Use Gumbel-Softmax for differentiable energy distance')
     p.add_argument('--quantile_weight', type=float, default=0.0,
@@ -229,8 +232,8 @@ def parse_args():
                    help='Use in-model series decomposition')
     p.add_argument('--decomp_kernel', type=int, default=5,
                    help='Kernel size for decomposition moving average')
-    p.add_argument('--sde_version', type=str, default='v1', choices=['v1', 'v2'],
-                   help='SDE family version (v2 adds MRW + Fractional OU)')
+    p.add_argument('--sde_version', type=str, default='v1', choices=['v1', 'v2', 'v3'],
+                   help='SDE version: v1=original, v2=+MRW/FracOU, v3=+GARCH/Momentum (non-Markovian)')
 
     # ── Phase 6: conditional signal fixes ──
     p.add_argument('--use_crps_avg', action='store_true', default=False,
@@ -264,7 +267,7 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
 
     # Determine n_sde_types from sde_version
-    n_sde_types = 7 if args.sde_version == 'v2' else 5
+    n_sde_types = 7 if args.sde_version in ('v2', 'v3') else 5
 
     cfg = PhantomConfig(
         context_len=args.context_len, patch_len=args.patch_len,
@@ -275,12 +278,13 @@ def main():
         cond_drop_prob=args.cond_drop_prob,
         n_sde_types=n_sde_types,
         # v2
-        use_student_t=args.use_student_t,
+        use_student_t=(args.head_type == 'mot' or args.use_student_t),
         patch_sizes=args.patch_sizes,
         n_input_channels=args.n_input_channels,
         use_decomposition=args.use_decomposition,
         decomp_kernel=args.decomp_kernel,
         use_film=args.use_film,
+        head_type=args.head_type,
     )
 
     model = PhantomModel(cfg).to(device)
