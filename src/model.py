@@ -77,6 +77,11 @@ class PhantomConfig:
     # Head type: 'mog' (mixture of Gaussians), 'mot' (mixture of Student-t), 'student_t' (single)
     head_type: str = 'mog'
 
+    # ── v3 additions (real multi-asset pretraining) ──
+    n_asset_types: int = 4             # crypto=0, equity=1, forex=2, commodity=3
+    use_asset_classifier: bool = False  # Asset-type auxiliary classifier
+    use_sign_classifier: bool = False   # Return-sign auxiliary classifier
+
     @property
     def n_patches(self) -> int:
         if self.patch_sizes is not None:
@@ -439,6 +444,12 @@ class PhantomModel(nn.Module):
         self.sde_classifier = nn.Linear(cfg.d_model, cfg.n_sde_types)
         self.vol_regressor = nn.Linear(cfg.d_model, 1)
 
+        # v3 auxiliary heads (real multi-asset pretraining)
+        if cfg.use_asset_classifier:
+            self.asset_classifier = nn.Linear(cfg.d_model, cfg.n_asset_types)
+        if cfg.use_sign_classifier:
+            self.sign_classifier = nn.Linear(cfg.d_model, 2)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -510,13 +521,15 @@ class PhantomModel(nn.Module):
         return self.decode(enc_out, horizon)
 
     def forward_auxiliary(self, x: torch.Tensor):
-        """Compute auxiliary predictions (SDE type + volatility).
+        """Compute auxiliary predictions (SDE type + volatility + v3 heads).
 
         Args:
             x: (B, L) or (B, L, C) raw daily log-returns.
         Returns:
-            sde_logits: (B, n_sde_types) classification logits.
-            vol_pred:   (B,) predicted realized volatility.
+            sde_logits:   (B, n_sde_types) classification logits.
+            vol_pred:     (B,) predicted realized volatility.
+            asset_logits: (B, n_asset_types) or None — asset-type classifier.
+            sign_logits:  (B, 2) or None — return-sign classifier.
         """
         enc_out = self.encode(x)  # (B, N, d_model)
 
@@ -526,7 +539,10 @@ class PhantomModel(nn.Module):
         sde_logits = self.sde_classifier(pooled)
         vol_pred = self.vol_regressor(pooled).squeeze(-1)
 
-        return sde_logits, vol_pred
+        asset_logits = self.asset_classifier(pooled) if hasattr(self, 'asset_classifier') else None
+        sign_logits = self.sign_classifier(pooled) if hasattr(self, 'sign_classifier') else None
+
+        return sde_logits, vol_pred, asset_logits, sign_logits
 
     def forward_cfg(self, x: torch.Tensor, horizon: torch.Tensor,
                     guidance_scale: float = 2.0):

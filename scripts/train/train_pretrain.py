@@ -109,7 +109,7 @@ def validate(model, val_x, val_h, val_yb, val_sde, val_rv, device,
         crps_val = crps_loss(log_pi, mu, sigma, y_single, nu=nu)
 
         # Auxiliary
-        sde_logits, vol_pred = model.forward_auxiliary(x)
+        sde_logits, vol_pred, _, _ = model.forward_auxiliary(x)
         sde_acc = (sde_logits.argmax(dim=-1) == sde).float().mean()
         vol_mse = F.mse_loss(vol_pred, rv)
 
@@ -146,6 +146,56 @@ def validate(model, val_x, val_h, val_yb, val_sde, val_rv, device,
     return {k: v / n_batches for k, v in accum.items()}
 
 
+@torch.no_grad()
+def validate_v3(model, val_x, val_h, val_y, val_asset, val_rv, device,
+                nll_weight=1.0, crps_weight=0.5, batch_size=512):
+    """Validation for v3 real data mode (single-target)."""
+    from src.losses import combined_loss_v3, crps_loss
+    model.eval()
+    n = val_x.size(0)
+    accum = {}
+    n_batches = 0
+
+    for i in range(0, n, batch_size):
+        x = val_x[i:i+batch_size].to(device)
+        h = val_h[i:i+batch_size].to(device)
+        y = val_y[i:i+batch_size].to(device)
+        asset = val_asset[i:i+batch_size].to(device)
+        rv = val_rv[i:i+batch_size].to(device)
+
+        log_pi, mu, sigma, nu = model(x, h)
+        loss, nll, crps = combined_loss_v3(
+            log_pi, mu, sigma, y, nu,
+            nll_weight=nll_weight, crps_weight=crps_weight)
+
+        # Auxiliary
+        _, vol_pred, asset_logits, sign_logits = model.forward_auxiliary(x)
+        vol_mse = F.mse_loss(vol_pred, rv)
+        asset_acc = (asset_logits.argmax(-1) == asset).float().mean() if asset_logits is not None else torch.tensor(0.)
+        sign_labels = (y > 0).long()
+        sign_acc = (sign_logits.argmax(-1) == sign_labels).float().mean() if sign_logits is not None else torch.tensor(0.)
+
+        # Head stats
+        pi = log_pi.exp()
+        eff_k = torch.exp(-torch.sum(pi * log_pi, dim=-1)).mean()
+        mean_mu = mu.abs().mean()
+        mean_sigma = sigma.mean()
+
+        for k, v in [('val_loss', loss), ('val_nll', nll), ('val_crps', crps),
+                      ('val_vol_mse', vol_mse), ('val_asset_acc', asset_acc),
+                      ('val_sign_acc', sign_acc), ('val_eff_k', eff_k),
+                      ('val_mean_mu', mean_mu), ('val_mean_sigma', mean_sigma)]:
+            accum[k] = accum.get(k, 0.0) + (v.item() if torch.is_tensor(v) else v)
+
+        if nu is not None:
+            accum['val_mean_nu'] = accum.get('val_mean_nu', 0.0) + nu.mean().item()
+
+        n_batches += 1
+
+    model.train()
+    return {k: v / n_batches for k, v in accum.items()}
+
+
 def save_checkpoint(path, model, optimizer, scaler, step, epoch, config, best_val_loss):
     torch.save({
         'step': step, 'epoch': epoch,
@@ -169,7 +219,8 @@ def load_checkpoint(path, model, optimizer, scaler):
 def parse_args():
     p = argparse.ArgumentParser(description="Phantom pre-training")
 
-    p.add_argument('--data_mode', type=str, default='online', choices=['shards', 'online'])
+    p.add_argument('--data_mode', type=str, default='online',
+                   choices=['shards', 'online', 'real_assets'])
     p.add_argument('--data_dir', type=str, default='data/')
     p.add_argument('--samples_per_epoch', type=int, default=1_000_000)
     p.add_argument('--n_workers', type=int, default=4)
@@ -249,6 +300,18 @@ def parse_args():
     p.add_argument('--var_match_weight', type=float, default=0.0,
                    help='Weight for variance matching loss (0 = disabled)')
 
+    # ── v3 flags (real multi-asset pretraining) ──
+    p.add_argument('--real_data_dir', type=str, default='data/processed/',
+                   help='Directory with train.npz/val.npz for real_assets mode')
+    p.add_argument('--nll_weight_v3', type=float, default=1.0,
+                   help='NLL weight for v3 real data training')
+    p.add_argument('--crps_weight_v3', type=float, default=0.5,
+                   help='CRPS weight for v3 real data training')
+    p.add_argument('--asset_cls_weight', type=float, default=0.3,
+                   help='Weight for asset-type + vol regressor auxiliary')
+    p.add_argument('--sign_cls_weight', type=float, default=0.1,
+                   help='Weight for return-sign classifier auxiliary')
+
     return p.parse_args()
 
 
@@ -269,6 +332,11 @@ def main():
     # Determine n_sde_types from sde_version
     n_sde_types = 7 if args.sde_version in ('v2', 'v3') else 5
 
+    # v3 real_assets mode overrides
+    is_v3 = args.data_mode == 'real_assets'
+    if is_v3:
+        args.n_input_channels = 6  # Force 6-channel OHLCV features
+
     cfg = PhantomConfig(
         context_len=args.context_len, patch_len=args.patch_len,
         patch_stride=args.patch_stride, d_model=args.d_model,
@@ -285,6 +353,9 @@ def main():
         decomp_kernel=args.decomp_kernel,
         use_film=args.use_film,
         head_type=args.head_type,
+        # v3
+        use_asset_classifier=is_v3,
+        use_sign_classifier=is_v3,
     )
 
     model = PhantomModel(cfg).to(device)
@@ -307,17 +378,28 @@ def main():
         print("SDE families: v2 (+ MRW, Fractional OU)")
 
     # Data
-    dataset = OnlineDataset(
-        context_len=cfg.context_len, n_branches=args.n_branches,
-        samples_per_epoch=args.samples_per_epoch, seed=args.seed,
-        n_input_channels=args.n_input_channels,
-        sde_version=args.sde_version,
-    )
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size, num_workers=args.n_workers,
-        pin_memory=device.type == 'cuda', drop_last=True,
-        persistent_workers=args.n_workers > 0,
-    )
+    if is_v3:
+        from src.real_data import RealAssetDataset
+        real_data_dir = Path(args.real_data_dir)
+        dataset = RealAssetDataset(str(real_data_dir / 'train.npz'))
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.n_workers,
+            pin_memory=device.type == 'cuda', drop_last=True,
+            persistent_workers=args.n_workers > 0,
+        )
+    else:
+        dataset = OnlineDataset(
+            context_len=cfg.context_len, n_branches=args.n_branches,
+            samples_per_epoch=args.samples_per_epoch, seed=args.seed,
+            n_input_channels=args.n_input_channels,
+            sde_version=args.sde_version,
+        )
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, num_workers=args.n_workers,
+            pin_memory=device.type == 'cuda', drop_last=True,
+            persistent_workers=args.n_workers > 0,
+        )
 
     steps_per_epoch = len(dataset) // args.batch_size
     total_steps = steps_per_epoch * args.epochs
@@ -349,13 +431,27 @@ def main():
             args.resume, model, optimizer, scaler)
         print(f"Resumed at step {start_step}, epoch {start_epoch}")
 
-    print(f"Generating validation set ({args.val_samples} samples, {args.n_branches} branches)...")
-    val_x, val_h, val_yb, val_sde, val_rv = make_validation_batch(
-        n_samples=args.val_samples, context_len=cfg.context_len,
-        n_branches=args.n_branches, seed=args.seed + 1234,
-        n_input_channels=args.n_input_channels,
-        sde_version=args.sde_version,
-    )
+    if is_v3:
+        from src.real_data import RealAssetDataset
+        real_data_dir = Path(args.real_data_dir)
+        val_ds = RealAssetDataset(str(real_data_dir / 'val.npz'))
+        # Subsample validation if too large
+        n_val = min(args.val_samples, len(val_ds))
+        idx = np.random.RandomState(args.seed + 1234).choice(len(val_ds), n_val, replace=False)
+        val_x = torch.from_numpy(val_ds.X[idx].astype(np.float32))
+        val_h = torch.from_numpy(val_ds.H[idx].astype(np.int64))
+        val_y = torch.from_numpy(val_ds.Y[idx].astype(np.float32))
+        val_asset = torch.from_numpy(val_ds.asset_type[idx].astype(np.int64))
+        val_rv = torch.from_numpy(val_ds.realized_vol[idx].astype(np.float32))
+        print(f"Loaded validation set: {n_val} samples from {real_data_dir / 'val.npz'}")
+    else:
+        print(f"Generating validation set ({args.val_samples} samples, {args.n_branches} branches)...")
+        val_x, val_h, val_yb, val_sde, val_rv = make_validation_batch(
+            n_samples=args.val_samples, context_len=cfg.context_len,
+            n_branches=args.n_branches, seed=args.seed + 1234,
+            n_input_channels=args.n_input_channels,
+            sde_version=args.sde_version,
+        )
 
     logger = Logger(Path(args.log_dir))
     ckpt_dir = Path(args.checkpoint_dir)
@@ -373,7 +469,7 @@ def main():
         'mean_mu': 0., 'mean_sigma': 0., 'eff_k': 0.,
         'grad_norm': 0.,
     }
-    if args.use_student_t:
+    if args.use_student_t or is_v3:
         run['mean_nu'] = 0.
     if args.quantile_weight > 0:
         run['quantile_loss'] = 0.
@@ -385,72 +481,128 @@ def main():
     print(f"{'='*60}\n")
 
     for epoch in range(start_epoch, args.epochs):
-        dataset.seed = args.seed + epoch * 1000
+        if not is_v3:
+            dataset.seed = args.seed + epoch * 1000
 
-        for batch_idx, (x, h, yb, sde_labels, rv_labels) in enumerate(loader):
+        for batch_idx, batch in enumerate(loader):
             lr = get_lr(global_step, args.warmup_steps, total_steps, args.lr, args.min_lr)
             set_lr(optimizer, lr)
 
-            x = x.to(device, non_blocking=True)
-            h = h.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-            sde_labels = sde_labels.to(device, non_blocking=True)
-            rv_labels = rv_labels.to(device, non_blocking=True)
+            if is_v3:
+                # ── v3 real data path ──
+                x, h, target, asset_labels, rv_labels = batch
+                x = x.to(device, non_blocking=True)
+                h = h.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                asset_labels = asset_labels.to(device, non_blocking=True)
+                rv_labels = rv_labels.to(device, non_blocking=True)
 
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                # Encode (needed for contrastive/variance losses)
-                enc_out = model.encode(x)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    enc_out = model.encode(x)
 
-                # Condition dropout
-                if model.training and model.cfg.cond_drop_prob > 0:
-                    mask = torch.rand(x.size(0), 1, 1, device=enc_out.device) > model.cfg.cond_drop_prob
-                    enc_out_masked = enc_out * mask
-                else:
-                    enc_out_masked = enc_out
+                    # Condition dropout
+                    if model.training and model.cfg.cond_drop_prob > 0:
+                        mask = torch.rand(x.size(0), 1, 1, device=enc_out.device) > model.cfg.cond_drop_prob
+                        enc_out_masked = enc_out * mask
+                    else:
+                        enc_out_masked = enc_out
 
-                log_pi, mu, sigma, nu = model.decode(enc_out_masked, h)
+                    log_pi, mu, sigma, nu = model.decode(enc_out_masked, h)
 
-                # Main loss: ED or CRPS-avg + NLL (+ optional quantile)
-                loss_main, primary, nll = combined_loss(
-                    log_pi, mu, sigma, yb,
-                    n_model_samples=args.n_model_samples,
-                    nll_weight=args.nll_weight,
-                    nu=nu,
-                    use_gumbel_softmax=args.use_gumbel_softmax,
-                    quantile_weight=args.quantile_weight,
-                    use_crps_avg=args.use_crps_avg,
-                )
+                    # Main loss: NLL + CRPS on single target
+                    from src.losses import combined_loss_v3
+                    loss_main, nll, crps_val = combined_loss_v3(
+                        log_pi, mu, sigma, target, nu,
+                        nll_weight=args.nll_weight_v3,
+                        crps_weight=args.crps_weight_v3,
+                    )
 
-                # Auxiliary losses: SDE classification + vol regression
-                sde_logits, vol_pred = model.forward_auxiliary(x)
-                loss_sde = F.cross_entropy(sde_logits, sde_labels)
-                loss_vol = F.mse_loss(vol_pred, rv_labels)
-                loss_aux = loss_sde + loss_vol
+                    # Auxiliary: asset-type classifier + vol regressor + sign classifier
+                    _, vol_pred, asset_logits, sign_logits = model.forward_auxiliary(x)
+                    loss_asset = F.cross_entropy(asset_logits, asset_labels)
+                    loss_vol = F.mse_loss(vol_pred, rv_labels)
+                    sign_labels = (target > 0).long()
+                    loss_sign = F.cross_entropy(sign_logits, sign_labels)
 
-                loss = loss_main + args.aux_weight * loss_aux
+                    loss_aux = loss_asset + loss_vol + args.sign_cls_weight * loss_sign
+                    loss = loss_main + args.asset_cls_weight * loss_aux
 
-                # Contrastive loss (InfoNCE)
-                if args.contrastive_weight > 0:
-                    from src.losses import contrastive_loss
-                    loss_contr = contrastive_loss(enc_out, yb)
-                    loss = loss + args.contrastive_weight * loss_contr
+                    # Encoder variance penalty
+                    if args.enc_var_weight > 0:
+                        from src.losses import encoder_variance_penalty
+                        loss_evar = encoder_variance_penalty(enc_out)
+                        loss = loss + args.enc_var_weight * loss_evar
 
-                # Encoder variance penalty
-                if args.enc_var_weight > 0:
-                    from src.losses import encoder_variance_penalty
-                    loss_evar = encoder_variance_penalty(enc_out)
-                    loss = loss + args.enc_var_weight * loss_evar
+                    loss = loss / args.grad_accum
 
-                # Moment matching losses
-                if args.mean_match_weight > 0 or args.var_match_weight > 0:
-                    from src.losses import moment_matching_loss
-                    mean_loss, var_loss = moment_matching_loss(log_pi, mu, sigma, yb, nu)
-                    if args.mean_match_weight > 0:
-                        loss = loss + args.mean_match_weight * mean_loss
-                    if args.var_match_weight > 0:
-                        loss = loss + args.var_match_weight * var_loss
+                # Track metrics for v3
+                primary = crps_val  # Use CRPS as primary metric
+                sde_labels = asset_labels
+                sde_logits = asset_logits
+                yb = None
 
-                loss = loss / args.grad_accum
+            else:
+                # ── Synthetic data path (v1/v2) ──
+                x, h, yb, sde_labels, rv_labels = batch
+                x = x.to(device, non_blocking=True)
+                h = h.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                sde_labels = sde_labels.to(device, non_blocking=True)
+                rv_labels = rv_labels.to(device, non_blocking=True)
+
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    enc_out = model.encode(x)
+
+                    # Condition dropout
+                    if model.training and model.cfg.cond_drop_prob > 0:
+                        mask = torch.rand(x.size(0), 1, 1, device=enc_out.device) > model.cfg.cond_drop_prob
+                        enc_out_masked = enc_out * mask
+                    else:
+                        enc_out_masked = enc_out
+
+                    log_pi, mu, sigma, nu = model.decode(enc_out_masked, h)
+
+                    # Main loss: ED or CRPS-avg + NLL (+ optional quantile)
+                    loss_main, primary, nll = combined_loss(
+                        log_pi, mu, sigma, yb,
+                        n_model_samples=args.n_model_samples,
+                        nll_weight=args.nll_weight,
+                        nu=nu,
+                        use_gumbel_softmax=args.use_gumbel_softmax,
+                        quantile_weight=args.quantile_weight,
+                        use_crps_avg=args.use_crps_avg,
+                    )
+
+                    # Auxiliary losses: SDE classification + vol regression
+                    sde_logits, vol_pred, _, _ = model.forward_auxiliary(x)
+                    loss_sde = F.cross_entropy(sde_logits, sde_labels)
+                    loss_vol = F.mse_loss(vol_pred, rv_labels)
+                    loss_aux = loss_sde + loss_vol
+
+                    loss = loss_main + args.aux_weight * loss_aux
+
+                    # Contrastive loss (InfoNCE)
+                    if args.contrastive_weight > 0:
+                        from src.losses import contrastive_loss
+                        loss_contr = contrastive_loss(enc_out, yb)
+                        loss = loss + args.contrastive_weight * loss_contr
+
+                    # Encoder variance penalty
+                    if args.enc_var_weight > 0:
+                        from src.losses import encoder_variance_penalty
+                        loss_evar = encoder_variance_penalty(enc_out)
+                        loss = loss + args.enc_var_weight * loss_evar
+
+                    # Moment matching losses
+                    if args.mean_match_weight > 0 or args.var_match_weight > 0:
+                        from src.losses import moment_matching_loss
+                        mean_loss, var_loss = moment_matching_loss(log_pi, mu, sigma, yb, nu)
+                        if args.mean_match_weight > 0:
+                            loss = loss + args.mean_match_weight * mean_loss
+                        if args.var_match_weight > 0:
+                            loss = loss + args.var_match_weight * var_loss
+
+                    loss = loss / args.grad_accum
 
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -481,15 +633,15 @@ def main():
             run['loss_aux'] += loss_aux.item()
             run['ed'] += primary.item()
             run['nll'] += nll.item()
-            run['loss_sde'] += loss_sde.item()
+            run['loss_sde'] += (loss_asset.item() if is_v3 else loss_sde.item())
             run['vol_mse'] += loss_vol.item()
             run['sde_acc'] += sde_acc
             run['mean_mu'] += mu.detach().abs().mean().item()
             run['mean_sigma'] += sigma.detach().mean().item()
             run['eff_k'] += eff_k
             run['grad_norm'] += grad_norm
-            if args.use_student_t and nu is not None:
-                run['mean_nu'] += nu.detach().mean().item()
+            if nu is not None and (args.use_student_t or is_v3):
+                run['mean_nu'] = run.get('mean_nu', 0.) + nu.detach().mean().item()
             run_count += 1
             global_step += 1
 
@@ -514,7 +666,7 @@ def main():
                     'grad_norm': run['grad_norm'] / run_count,
                     'steps/s': sps, 'eta_min': eta / 60,
                 }
-                if args.use_student_t and 'mean_nu' in run:
+                if 'mean_nu' in run and run['mean_nu'] != 0.:
                     metrics['mean_nu'] = run['mean_nu'] / run_count
                 logger.log(metrics, step=global_step)
                 # Reset accumulators
@@ -523,10 +675,14 @@ def main():
                 run_count = 0
 
             if global_step % args.val_every == 0:
-                val_m = validate(model, val_x, val_h, val_yb, val_sde, val_rv,
-                                 device, args.n_model_samples, args.nll_weight,
-                                 use_gumbel_softmax=args.use_gumbel_softmax,
-                                 quantile_weight=args.quantile_weight)
+                if is_v3:
+                    val_m = validate_v3(model, val_x, val_h, val_y, val_asset, val_rv,
+                                        device, args.nll_weight_v3, args.crps_weight_v3)
+                else:
+                    val_m = validate(model, val_x, val_h, val_yb, val_sde, val_rv,
+                                     device, args.n_model_samples, args.nll_weight,
+                                     use_gumbel_softmax=args.use_gumbel_softmax,
+                                     quantile_weight=args.quantile_weight)
                 logger.log(val_m, step=global_step)
                 if val_m['val_loss'] < best_val_loss:
                     best_val_loss = val_m['val_loss']

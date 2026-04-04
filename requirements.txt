@@ -4,5 +4,5 @@ tqdm>=4.65
 torch>=2.0
 ccxt
 pandas>=2.0
-pandas_datareader>=0.10
+yfinance>=0.2
 requests>=2.28

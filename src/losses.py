@@ -648,3 +648,45 @@ def combined_loss(
         total = total + quantile_weight * ql
 
     return total, primary, nll
+
+
+# ── Combined Loss v3 (single-target, for real data) ──────────────
+
+def combined_loss_v3(
+    log_pi: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    target: torch.Tensor,
+    nu: torch.Tensor | None = None,
+    nll_weight: float = 1.0,
+    crps_weight: float = 0.5,
+    quantile_weight: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Combined loss for single-target training (v3 real data).
+
+    Primary: NLL (closed-form, strong conditional gradient)
+    Secondary: CRPS (proper scoring rule, smooths optimization)
+
+    Args:
+        log_pi: (B, K) log mixture weights.
+        mu:     (B, K) component means.
+        sigma:  (B, K) component stds/scales.
+        target: (B,)   single realized scalar target.
+        nu:     (B, K) degrees of freedom (None for Gaussian).
+        nll_weight: Weight for NLL term.
+        crps_weight: Weight for CRPS term.
+        quantile_weight: Weight for optional quantile loss.
+
+    Returns:
+        (total_loss, nll_term, crps_term) — all scalars.
+    """
+    nll = nll_loss(log_pi, mu, sigma, target, nu)
+    crps = crps_loss(log_pi, mu, sigma, target, nu)
+
+    total = nll_weight * nll + crps_weight * crps
+
+    if quantile_weight > 0:
+        ql = quantile_loss(log_pi, mu, sigma, target, nu)
+        total = total + quantile_weight * ql
+
+    return total, nll, crps

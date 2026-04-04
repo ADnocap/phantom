@@ -21,10 +21,16 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data & model artifacts
-data/
+# Data files (raw and processed)
+/data/raw/
+/data/processed/
+/data/*.npz
+/data/*.csv
+
+# Model artifacts
 checkpoints/
 checkpoints_ft/
+checkpoints_v3/
 outputs/
 *.pt
 *.pth
