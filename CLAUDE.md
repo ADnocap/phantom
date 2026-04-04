@@ -53,10 +53,13 @@ src/
 
 scripts/
   train/
-    train_pretrain.py   Pre-training (synthetic or real data)
+    train_pretrain.py   Pre-training (synthetic or real data, v1-v5)
+    train_v6.py         v6 crypto-focused fine-tuning from v5 checkpoint
     train_finetune.py   BTC fine-tuning
   eval/
     eval_model.py           Checkpoint evaluation (CRPS, coverage, calibration)
+    eval_v5.py              v5 relative return evaluation
+    eval_v6.py              v6 crypto evaluation with feature ablation
     visualize_btc.py        BTC prediction visualization
     plot_pretrain_v2.py     Synthetic pretraining metrics (16-panel)
     plot_pretrain_v3.py     Real-data pretraining metrics (16-panel)
@@ -66,11 +69,14 @@ scripts/
     plot_experiments.py     Compare multiple experiment configs
   data/
     fetch_crypto.py         Fetch crypto OHLCV (Binance + CryptoCompare)
+    fetch_crypto_v6.py      Fetch crypto OHLCV + taker buy + funding rates + OI
     fetch_yfinance.py       Fetch equity/ETF/forex/commodity OHLCV (yfinance)
     build_dataset.py        Raw OHLCV -> 6-channel features -> train/val/test .npz
+    build_dataset_v6.py     Crypto-only 9-channel dataset builder
     validate_data.py        Dataset quality checks
   slurm/
     train_v3.slurm          v3 real-data pretraining job
+    train_v6.slurm          v6 crypto-focused training job
     train_exp*.slurm        v1/v2 synthetic experiments
     ft_exp*.slurm           Fine-tuning experiments
 

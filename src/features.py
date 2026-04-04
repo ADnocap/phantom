@@ -104,6 +104,66 @@ def compute_ohlcv_features(
     return features.astype(np.float32)
 
 
+def compute_ohlcv_features_v6(
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    taker_buy_volume: np.ndarray | None = None,
+    funding_rate: np.ndarray | None = None,
+    vol_window: int = 30,
+    mom_window: int = 10,
+) -> np.ndarray:
+    """Compute 8-channel features for v6 (6 OHLCV + 2 crypto-specific).
+
+    Channels 0-5: identical to compute_ohlcv_features()
+    Channel 6: Taker buy ratio (centered at 0) — order flow direction
+    Channel 7: Funding rate (scaled) — leveraged positioning sentiment
+
+    Note: OI was dropped — Binance only provides 30 days of OI history.
+
+    Args:
+        open_, high, low, close, volume: (N,) daily OHLCV arrays.
+        taker_buy_volume: (N,) taker buy base volume, or None (zero-fill).
+        funding_rate: (N,) daily average funding rate, or None (zero-fill).
+        vol_window: Window for trailing realized vol (default 30).
+        mom_window: Window for trailing momentum (default 10).
+
+    Returns:
+        features: (N-1, 8) float32 array.
+    """
+    # Base 6-channel features
+    base = compute_ohlcv_features(open_, high, low, close, volume,
+                                  vol_window, mom_window)
+    n = len(base)  # N-1
+
+    # Channel 6: Taker buy ratio, centered at 0 (range ~ [-0.5, 0.5])
+    if taker_buy_volume is not None:
+        tbv = taker_buy_volume[1:]  # align with base (skip first)
+        vol = volume[1:]
+        taker_ratio = tbv / (vol + 1e-10) - 0.5
+    else:
+        taker_ratio = np.zeros(n, dtype=np.float64)
+
+    # Channel 7: Funding rate (scaled by 100 so magnitude ~ 0.01)
+    if funding_rate is not None:
+        fr = funding_rate[1:] * 100.0  # align with base
+    else:
+        fr = np.zeros(n, dtype=np.float64)
+
+    features = np.column_stack([base, taker_ratio, fr])
+
+    # Safety: replace NaN/Inf
+    bad = ~np.isfinite(features)
+    if bad.any():
+        n_bad = bad.sum()
+        warnings.warn(f"Replaced {n_bad} non-finite values in v6 features")
+        features[bad] = 0.0
+
+    return features.astype(np.float32)  # (N-1, 8)
+
+
 def validate_ohlcv(
     open_: np.ndarray,
     high: np.ndarray,

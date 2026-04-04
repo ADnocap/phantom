@@ -173,20 +173,67 @@ All plateau at same ED. Problem is common to all configs.
 
 ---
 
-## Phase 11: v5 — Relative Return Prediction (in progress)
+## Phase 11: v5 — Relative Return Prediction (complete)
 
 **Motivation**: Absolute returns are unpredictable from price features, but relative returns (asset vs peer group) might be. Shared market factors cancel, leaving idiosyncratic signal (volume surges, momentum divergence).
 
-**Setup**: Same 268 assets, 120-day context, 30 horizons. Target changed from absolute returns to relative: `Y_relative = Y_asset - mean(Y[same date, same class])`. Computed offline over 25,395 (date, class) groups. 99.7% of samples adjusted. Initialized from v3. mean_mse_weight=0.3, min_mse_horizon=5.
+**Setup**: 413 assets (61 crypto, 224 equity, 57 EU equity, 15 forex, 26 commodity), 120-day context, 30 horizons. Target changed from absolute returns to relative: `Y_relative = Y_asset - mean(Y[same date, same class])`. Computed offline over 25,395 (date, class) groups. 99.7% of samples adjusted. Initialized from v3. NLL + CRPS loss. mean_mse_weight=0.3, min_mse_horizon=5. 20 epochs, batch_size=512, lr=3e-4. Trained on LaRuche A100.
 
-**Key Evaluation Metrics** (new for v5):
+**Key Evaluation Metrics**:
 - **Rank IC**: Spearman correlation between predicted and actual relative returns, averaged across dates
 - **Long-short portfolio**: buy top quintile predicted, short bottom quintile — PnL
 - **IC by horizon**: which horizons have cross-sectional signal?
 
-**Status**: Dataset built, training submitted to LaRuche.
+### v5 Results (step 39,000, OOS: 2025-01 to 2026-03, 81,106 samples, 412 assets)
 
-**Expected outcome**: If Rank IC > 0.02 → genuine cross-sectional signal exists. If IC ≈ 0 → OHLCV features lack both absolute AND relative predictive power, and external features (macro, sentiment, on-chain) are needed.
+| Metric | Value |
+|--------|-------|
+| **Rank IC (10d)** | **0.092** (t-stat=11.8) |
+| Rank IC (1d) | 0.045 (t-stat=5.4) |
+| Rank IC (30d) | 0.119 (t-stat=14.6) |
+| IC positive days | 70% |
+| Monthly IC positive | 13/15 months |
+| **L/S Sharpe** | **4.55** (no costs) |
+| L/S cumulative | 431% |
+| L/S win rate | 61% |
+| L/S max drawdown | -65.6% |
+| NLL | -1.375 |
+| Pred mean std | 0.0034 |
+| Corr(pred_mean, actual) | 0.039 |
+| Corr(pred_std, \|error\|) | 0.299 |
+| Coverage 50% | 56.9% |
+| Coverage 80% | 87.2% |
+| Coverage 90% | 93.7% |
+| Coverage 95% | 96.8% |
+| ECE | ~0.01 |
+| Nu (mean) | 2.11 (heavy tails, near floor) |
+
+### IC by Asset Class (h=10d)
+
+| Asset Class | Rank IC | Interpretation |
+|-------------|---------|----------------|
+| **Crypto** | **0.144** | Strong signal — drives overall result |
+| Commodity | 0.084 | Moderate signal |
+| Forex | 0.007 | No signal |
+| Equity | 0.003 | No signal |
+
+### Key Findings
+
+1. **Cross-sectional signal exists in OHLCV** — IC=0.09 at 10d, well above threshold (0.02)
+2. **Signal is almost entirely crypto** (IC=0.14) with some commodity contribution (IC=0.08). Equity and forex show no signal.
+3. **IC increases with horizon** — 0.045 at 1d → 0.12 at 30d, consistent with drift SNR scaling as sqrt(h)
+4. **Distributional calibration remains excellent** — PIT near-uniform, coverage well-calibrated, ECE ~0.01
+5. **Nu ≈ 2 everywhere** — model pushes to minimum allowed df, indicating very heavy-tailed relative returns
+6. **Mu predictions are small but cross-sectionally informative** — absolute corr=0.039 is low, but ranking signal (IC=0.09) is strong
+7. **L/S Sharpe of 4.55 is pre-cost** — realistic Sharpe after transaction costs, slippage, and market impact likely 1.0-2.0
+
+### v5 vs Previous Phases
+
+| Aspect | v3 (absolute) | v4 (multi-horizon absolute) | v5 (relative) |
+|--------|---------------|----------------------------|---------------|
+| Directional signal | None (corr=-0.01) | Memorized, didn't generalize | **IC=0.09** (cross-sectional) |
+| Uncertainty calibration | corr=0.50 | corr~0.30 | corr=0.30 |
+| What it proves | OHLCV → good vol estimates | Absolute direction is unpredictable | **Relative ranking is predictable** |
 
 ---
 
@@ -200,7 +247,7 @@ All plateau at same ED. Problem is common to all configs.
 | Asset-type classifier | v3+ | 94%+ accuracy, forces encoder discrimination |
 | Uncertainty calibration | v3+ | Corr(pred_std, \|error\|) = 0.50 — real cross-asset knowledge |
 | Multi-horizon decoding | v4+ | Efficient batched 30-query cross-attention |
-| Relative return targets | v5 | TBD — tests cross-sectional predictability |
+| **Relative return targets** | **v5** | **IC=0.09 cross-sectional signal from OHLCV** |
 
 ## What Didn't Work
 
@@ -210,10 +257,38 @@ All plateau at same ED. Problem is common to all configs.
 | Synthetic data mixing for regularization | Synthetic features are distinguishable from real (v4b) |
 | Higher dropout/weight decay | Doesn't fix the fundamental lack of directional signal (v4b) |
 | Longer horizons alone | SNR improves but still insufficient for absolute prediction (v4) |
+| Absolute return prediction from OHLCV | Weak-form EMH holds — no directional signal at any horizon 1-30d (v3, v4) |
+
+## Phase 12: v6 — Crypto-Focused + Derivative Features (in progress)
+
+**Motivation**: v5 signal is almost entirely crypto (IC=0.14). Focus on crypto and add 3 new derivative/microstructure features to boost cross-sectional signal.
+
+**Setup**: Crypto-only (~60 assets), 9 input channels (6 OHLCV + 3 new), 120-day context, 30 horizons. Initialized from v5 weights with zero-padded patch embedding (30→45 input dim). Daily resolution.
+
+**New Features**:
+| Channel | Feature | Source | History | Signal |
+|---------|---------|--------|---------|--------|
+| 6 | Taker buy ratio | Binance kline (field 9/5) | Since listing | Order flow direction |
+| 7 | Funding rate | Binance Futures API | 2019-2020+ | Crowded positioning reversal |
+| 8 | OI change | Binance Futures API | 2019-2020+ | Positioning intensity |
+
+**Training Recipe**: Two-phase from v5 checkpoint:
+- Phase A (5K steps): Only patch embed + head unfrozen — new channel weights learn
+- Phase B (up to 45K steps): Full fine-tuning with LLRD=0.8, early stopping (patience=10)
+- Random feature masking (p=0.15) on channels 6-8 for regularization
+- No asset classifier (single class)
+
+**Key Evaluation**: Same metrics as v5 for comparison + feature ablation (zero each new channel, measure IC delta).
+
+**Success Criteria**: Crypto IC > 0.16 (v5 baseline: 0.144), at least 1 new channel shows measurable IC contribution.
+
+**Status**: Code complete, dataset pending (need to fetch funding + OI data, build dataset, run on LaRuche).
+
+---
 
 ## Next Steps
 
-1. **v5 results** — If Rank IC > 0.02, pursue relative return strategy (pair trading, cross-sectional alpha)
-2. **External features** — If v5 fails, add macro/sentiment/on-chain data for directional prediction
-3. **BTC fine-tuning** — Fine-tune best model on BTC with 6-channel features for distributional forecasting
-4. **Production deployment** — Package the volatility term structure model for risk/portfolio use
+1. **v6 execution** — Fetch data, build dataset, train on LaRuche, evaluate
+2. **v7: 4h granularity** — If v6 features help, add 4h bars for 6x more data
+3. **Transaction cost analysis** — Validate L/S strategy survives real-world costs
+4. **Publication** — Write up v1→v6 progression
