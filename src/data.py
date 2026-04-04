@@ -257,3 +257,88 @@ def make_validation_batch(
 
     return (torch.from_numpy(X), torch.from_numpy(H), torch.from_numpy(Y_branches),
             torch.from_numpy(SDE_idx), torch.from_numpy(RV))
+
+
+# ── Synthetic curve dataset (v4 — multi-horizon) ─────────────────
+
+class SyntheticCurveDataset(IterableDataset):
+    """Generate synthetic SDE samples with multi-horizon curve targets.
+
+    Each sample: (x, y_curve, asset_type=0, realized_vol)
+    - x: (context_len, 6) — 6-channel features from synthetic OHLCV
+    - y_curve: (max_horizon,) — cumulative returns at horizons 1..max_horizon
+    - asset_type: always 0 (synthetic)
+    - realized_vol: trailing vol from context
+
+    Uses GARCH + Momentum SDEs (non-Markovian, have genuine conditional signal).
+    """
+
+    def __init__(
+        self,
+        context_len: int = 120,
+        max_horizon: int = 30,
+        samples_per_epoch: int = 200_000,
+        seed: int | None = None,
+    ):
+        self.context_len = context_len
+        self.max_horizon = max_horizon
+        self.samples_per_epoch = samples_per_epoch
+        self.seed = seed
+
+        # Only use GARCH + Momentum (non-Markovian, have conditional mean signal)
+        self.sde_types = ['garch', 'momentum']
+        self.sde_weights = [0.5, 0.5]
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def __iter__(self):
+        from .sde import sample_params, simulate_daily_returns
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            per_worker = self.samples_per_epoch // worker_info.num_workers
+            worker_seed = (self.seed or 0) + worker_info.id * 10000
+        else:
+            per_worker = self.samples_per_epoch
+            worker_seed = self.seed or 0
+
+        rng = np.random.default_rng(worker_seed)
+        total_days = self.context_len + self.max_horizon
+
+        for _ in range(per_worker):
+            sde_type = rng.choice(self.sde_types, p=self.sde_weights)
+            params = sample_params(sde_type, rng=rng)
+
+            # Generate full path: context + forward
+            returns = simulate_daily_returns(sde_type, params, total_days)
+
+            ctx = returns[:self.context_len]      # (context_len,)
+            fwd = returns[self.context_len:]       # (max_horizon,)
+            y_curve = np.cumsum(fwd).astype(np.float32)  # cumulative returns
+
+            # Build 6-channel features from synthetic returns.
+            # Only ch0 (returns) and ch4 (trailing vol) are accurate from SDE.
+            # Ch1-3 are set to zero (like forex with no OHLCV detail).
+            # Ch5 (momentum) is computable from returns.
+            # This avoids the model learning artifacts from fake OHLCV.
+            x = np.zeros((self.context_len, 6), dtype=np.float32)
+            x[:, 0] = ctx                                    # log returns (exact)
+            x[:, 1] = np.abs(ctx)                             # rough intraday range proxy
+            x[:, 2] = 0.0                                     # no candle body info
+            x[:, 3] = 0.0                                     # no volume
+            # Ch4: trailing realized vol (30d)
+            import pandas as pd
+            ret_series = pd.Series(ctx)
+            x[:, 4] = ret_series.rolling(30, min_periods=2).std().fillna(0).values * np.sqrt(252)
+            # Ch5: trailing momentum (10d)
+            x[:, 5] = ret_series.rolling(10, min_periods=1).sum().values
+
+            rv = float(np.std(ctx) * np.sqrt(365))
+
+            yield (
+                torch.from_numpy(x),
+                torch.from_numpy(y_curve),
+                torch.tensor(0, dtype=torch.long),   # asset_type = 0 (synthetic)
+                torch.tensor(rv, dtype=torch.float32),
+            )

@@ -22,10 +22,8 @@ env/
 .ipynb_checkpoints/
 
 # Data files (raw and processed)
-/data/raw/
-/data/processed/
-/data/*.npz
-/data/*.csv
+data/*
+
 
 # Model artifacts
 checkpoints/

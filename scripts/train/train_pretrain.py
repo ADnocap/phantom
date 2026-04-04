@@ -57,14 +57,27 @@ class Logger:
     def __init__(self, log_dir):
         log_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = log_dir / "train_log.csv"
+        self.val_csv_path = log_dir / "val_log.csv"
         self._header_written = False
+        self._val_header_written = False
 
     def log(self, metrics, step, console=True):
-        if not self._header_written:
-            with open(self.csv_path, 'w') as f:
-                f.write("step," + ",".join(metrics.keys()) + "\n")
-            self._header_written = True
-        with open(self.csv_path, 'a') as f:
+        # Detect if this is a validation row (keys start with 'val_')
+        is_val = any(k.startswith('val_') for k in metrics.keys())
+        csv_path = self.val_csv_path if is_val else self.csv_path
+
+        if is_val:
+            if not self._val_header_written:
+                with open(csv_path, 'w') as f:
+                    f.write("step," + ",".join(metrics.keys()) + "\n")
+                self._val_header_written = True
+        else:
+            if not self._header_written:
+                with open(csv_path, 'w') as f:
+                    f.write("step," + ",".join(metrics.keys()) + "\n")
+                self._header_written = True
+
+        with open(csv_path, 'a') as f:
             vals = ",".join(f"{v:.6f}" if isinstance(v, float) else str(v) for v in metrics.values())
             f.write(f"{step},{vals}\n")
         if console:
@@ -196,6 +209,59 @@ def validate_v3(model, val_x, val_h, val_y, val_asset, val_rv, device,
     return {k: v / n_batches for k, v in accum.items()}
 
 
+@torch.no_grad()
+def validate_v4(model, val_x, val_y, val_asset, val_rv, device,
+                nll_weight=1.0, crps_weight=0.5, mean_mse_weight=1.0,
+                horizon_weighting='sqrt', batch_size=512):
+    """Validation for v4 multi-horizon curve prediction."""
+    from src.losses import combined_loss_v4
+    model.eval()
+    n = val_x.size(0)
+    accum = {}
+    n_batches = 0
+
+    for i in range(0, n, batch_size):
+        x = val_x[i:i+batch_size].to(device)
+        y_curve = val_y[i:i+batch_size].to(device)
+        asset = val_asset[i:i+batch_size].to(device)
+        rv = val_rv[i:i+batch_size].to(device)
+
+        log_pi, mu, sigma, nu = model(x)  # multi-horizon: (B, H, K)
+        loss, nll, crps, mse = combined_loss_v4(
+            log_pi, mu, sigma, y_curve, nu,
+            nll_weight=nll_weight, crps_weight=crps_weight,
+            mean_mse_weight=mean_mse_weight, horizon_weighting=horizon_weighting)
+
+        # Pred mean stats (key metric — is mu alive?)
+        pi = log_pi.exp()
+        pred_mean = (pi * mu).sum(dim=-1)  # (B, H)
+        pred_mean_std = pred_mean.std().item()
+
+        # Auxiliary
+        _, vol_pred, asset_logits, sign_logits = model.forward_auxiliary(x)
+        vol_mse = F.mse_loss(vol_pred, rv)
+        asset_acc = (asset_logits.argmax(-1) == asset).float().mean() if asset_logits is not None else torch.tensor(0.)
+
+        # Mean sigma and nu (averaged across horizons)
+        mean_sigma = sigma.mean().item()
+        mean_mu = mu.abs().mean().item()
+
+        for k, v in [('val_loss', loss), ('val_nll', nll), ('val_crps', crps),
+                      ('val_mean_mse', mse), ('val_pred_mean_std', pred_mean_std),
+                      ('val_vol_mse', vol_mse), ('val_asset_acc', asset_acc),
+                      ('val_mean_sigma', mean_sigma), ('val_mean_mu', mean_mu)]:
+            val = v.item() if torch.is_tensor(v) else v
+            accum[k] = accum.get(k, 0.0) + val
+
+        if nu is not None:
+            accum['val_mean_nu'] = accum.get('val_mean_nu', 0.0) + nu.mean().item()
+
+        n_batches += 1
+
+    model.train()
+    return {k: v / n_batches for k, v in accum.items()}
+
+
 def save_checkpoint(path, model, optimizer, scaler, step, epoch, config, best_val_loss):
     torch.save({
         'step': step, 'epoch': epoch,
@@ -220,7 +286,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Phantom pre-training")
 
     p.add_argument('--data_mode', type=str, default='online',
-                   choices=['shards', 'online', 'real_assets'])
+                   choices=['shards', 'online', 'real_assets', 'v4_real_assets', 'v5_real_assets'])
     p.add_argument('--data_dir', type=str, default='data/')
     p.add_argument('--samples_per_epoch', type=int, default=1_000_000)
     p.add_argument('--n_workers', type=int, default=4)
@@ -260,7 +326,10 @@ def parse_args():
     p.add_argument('--save_every', type=int, default=5000)
     p.add_argument('--checkpoint_dir', type=str, default='checkpoints/')
     p.add_argument('--log_dir', type=str, default='logs/pretrain/')
-    p.add_argument('--resume', type=str, default=None)
+    p.add_argument('--resume', type=str, default=None,
+                   help='Resume full training state from checkpoint')
+    p.add_argument('--init_from', type=str, default=None,
+                   help='Initialize model weights from checkpoint (partial transfer, no optimizer)')
     p.add_argument('--val_samples', type=int, default=2048)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', type=str, default=None)
@@ -304,13 +373,26 @@ def parse_args():
     p.add_argument('--real_data_dir', type=str, default='data/processed/',
                    help='Directory with train.npz/val.npz for real_assets mode')
     p.add_argument('--nll_weight_v3', type=float, default=1.0,
-                   help='NLL weight for v3 real data training')
+                   help='NLL weight for v3/v4 real data training')
     p.add_argument('--crps_weight_v3', type=float, default=0.5,
-                   help='CRPS weight for v3 real data training')
+                   help='CRPS weight for v3/v4 real data training')
     p.add_argument('--asset_cls_weight', type=float, default=0.3,
                    help='Weight for asset-type + vol regressor auxiliary')
     p.add_argument('--sign_cls_weight', type=float, default=0.1,
                    help='Weight for return-sign classifier auxiliary')
+
+    # ── v4 flags (multi-horizon curve prediction) ──
+    p.add_argument('--max_horizon', type=int, default=30,
+                   help='Maximum prediction horizon for v4 (default 30)')
+    p.add_argument('--mean_mse_weight', type=float, default=1.0,
+                   help='Weight for horizon-weighted mean MSE loss (v4)')
+    p.add_argument('--horizon_weighting', type=str, default='sqrt',
+                   choices=['sqrt', 'linear', 'log', 'uniform'],
+                   help='How to weight mean MSE across horizons (v4)')
+    p.add_argument('--min_mse_horizon', type=int, default=0,
+                   help='Only apply mean MSE on horizons >= this (v4, 0=all)')
+    p.add_argument('--synth_fraction', type=float, default=0.0,
+                   help='Fraction of batch from synthetic GARCH/Momentum SDEs (v4)')
 
     return p.parse_args()
 
@@ -332,9 +414,12 @@ def main():
     # Determine n_sde_types from sde_version
     n_sde_types = 7 if args.sde_version in ('v2', 'v3') else 5
 
-    # v3 real_assets mode overrides
+    # v3/v4/v5 real_assets mode overrides
     is_v3 = args.data_mode == 'real_assets'
-    if is_v3:
+    is_v4 = args.data_mode == 'v4_real_assets'
+    is_v5 = args.data_mode == 'v5_real_assets'
+    is_real = is_v3 or is_v4 or is_v5
+    if is_real:
         args.n_input_channels = 6  # Force 6-channel OHLCV features
 
     cfg = PhantomConfig(
@@ -354,8 +439,11 @@ def main():
         use_film=args.use_film,
         head_type=args.head_type,
         # v3
-        use_asset_classifier=is_v3,
+        use_asset_classifier=is_real,
         use_sign_classifier=is_v3,
+        # v4/v5
+        max_horizon=args.max_horizon,
+        multi_horizon=(is_v4 or is_v5),
     )
 
     model = PhantomModel(cfg).to(device)
@@ -378,7 +466,60 @@ def main():
         print("SDE families: v2 (+ MRW, Fractional OU)")
 
     # Data
-    if is_v3:
+    if is_v5:
+        from src.real_data import RealAssetDatasetV5
+        real_data_dir = Path(args.real_data_dir)
+        dataset = RealAssetDatasetV5(str(real_data_dir / 'train.npz'))
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.n_workers,
+            pin_memory=device.type == 'cuda', drop_last=True,
+            persistent_workers=args.n_workers > 0,
+        )
+        _synth_loader = None
+    elif is_v4 or is_v5:
+        from src.real_data import RealAssetDatasetV4
+        real_data_dir = Path(args.real_data_dir)
+        real_dataset = RealAssetDatasetV4(str(real_data_dir / 'train.npz'))
+
+        if args.synth_fraction > 0:
+            # Mixed real + synthetic dataloader
+            from src.data import SyntheticCurveDataset
+            from torch.utils.data import ConcatDataset
+
+            n_real = len(real_dataset)
+            n_synth = int(n_real * args.synth_fraction / (1 - args.synth_fraction))
+            synth_dataset = SyntheticCurveDataset(
+                context_len=args.context_len, max_horizon=args.max_horizon,
+                samples_per_epoch=n_synth, seed=args.seed,
+            )
+            print(f"Mixing: {n_real:,} real + {n_synth:,} synthetic "
+                  f"({args.synth_fraction*100:.0f}% synth)")
+
+            # Use separate loaders and interleave in training loop
+            real_loader = DataLoader(
+                real_dataset, batch_size=int(args.batch_size * (1 - args.synth_fraction)),
+                shuffle=True, num_workers=args.n_workers,
+                pin_memory=device.type == 'cuda', drop_last=True,
+                persistent_workers=args.n_workers > 0,
+            )
+            synth_loader = DataLoader(
+                synth_dataset, batch_size=int(args.batch_size * args.synth_fraction),
+                num_workers=0, pin_memory=device.type == 'cuda', drop_last=True,
+            )
+            dataset = real_dataset  # for len() computation
+            loader = real_loader
+            _synth_loader = synth_loader
+        else:
+            dataset = real_dataset
+            loader = DataLoader(
+                dataset, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.n_workers,
+                pin_memory=device.type == 'cuda', drop_last=True,
+                persistent_workers=args.n_workers > 0,
+            )
+            _synth_loader = None
+    elif is_v3:
         from src.real_data import RealAssetDataset
         real_data_dir = Path(args.real_data_dir)
         dataset = RealAssetDataset(str(real_data_dir / 'train.npz'))
@@ -430,12 +571,54 @@ def main():
         start_step, start_epoch, best_val_loss = load_checkpoint(
             args.resume, model, optimizer, scaler)
         print(f"Resumed at step {start_step}, epoch {start_epoch}")
+    elif args.init_from:
+        # Partial weight transfer (e.g., v3 → v4)
+        ckpt = torch.load(args.init_from, map_location='cpu', weights_only=False)
+        src_state = ckpt['model_state_dict']
+        tgt_state = model.state_dict()
+        loaded, skipped = 0, 0
+        for k, v in src_state.items():
+            if k in tgt_state and tgt_state[k].shape == v.shape:
+                tgt_state[k] = v
+                loaded += 1
+            elif k in tgt_state:
+                # Partial copy for size mismatches (e.g., horizon_embed, pos_enc)
+                src_shape, tgt_shape = v.shape, tgt_state[k].shape
+                slices = tuple(slice(0, min(s, t)) for s, t in zip(src_shape, tgt_shape))
+                tgt_state[k][slices] = v[slices]
+                loaded += 1
+                print(f"  Partial load: {k} {src_shape} → {tgt_shape}")
+            else:
+                skipped += 1
+        model.load_state_dict(tgt_state)
+        print(f"Initialized from {args.init_from}: {loaded} params loaded, {skipped} skipped")
 
-    if is_v3:
+    if is_v5:
+        from src.real_data import RealAssetDatasetV5
+        real_data_dir = Path(args.real_data_dir)
+        val_ds = RealAssetDatasetV5(str(real_data_dir / 'val.npz'))
+        n_val = min(args.val_samples, len(val_ds))
+        idx = np.random.RandomState(args.seed + 1234).choice(len(val_ds), n_val, replace=False)
+        val_x = torch.from_numpy(val_ds.X[idx].astype(np.float32))
+        val_y_curve = torch.from_numpy(val_ds.Y_relative[idx].astype(np.float32))
+        val_asset = torch.from_numpy(val_ds.asset_type[idx].astype(np.int64))
+        val_rv = torch.from_numpy(val_ds.realized_vol[idx].astype(np.float32))
+        print(f"Loaded v5 validation set: {n_val} samples (relative targets)")
+    elif is_v4 or is_v5:
+        from src.real_data import RealAssetDatasetV4
+        real_data_dir = Path(args.real_data_dir)
+        val_ds = RealAssetDatasetV4(str(real_data_dir / 'val.npz'))
+        n_val = min(args.val_samples, len(val_ds))
+        idx = np.random.RandomState(args.seed + 1234).choice(len(val_ds), n_val, replace=False)
+        val_x = torch.from_numpy(val_ds.X[idx].astype(np.float32))
+        val_y_curve = torch.from_numpy(val_ds.Y[idx].astype(np.float32))
+        val_asset = torch.from_numpy(val_ds.asset_type[idx].astype(np.int64))
+        val_rv = torch.from_numpy(val_ds.realized_vol[idx].astype(np.float32))
+        print(f"Loaded v4 validation set: {n_val} samples from {real_data_dir / 'val.npz'}")
+    elif is_v3:
         from src.real_data import RealAssetDataset
         real_data_dir = Path(args.real_data_dir)
         val_ds = RealAssetDataset(str(real_data_dir / 'val.npz'))
-        # Subsample validation if too large
         n_val = min(args.val_samples, len(val_ds))
         idx = np.random.RandomState(args.seed + 1234).choice(len(val_ds), n_val, replace=False)
         val_x = torch.from_numpy(val_ds.X[idx].astype(np.float32))
@@ -469,8 +652,11 @@ def main():
         'mean_mu': 0., 'mean_sigma': 0., 'eff_k': 0.,
         'grad_norm': 0.,
     }
-    if args.use_student_t or is_v3:
+    if args.use_student_t or is_real:
         run['mean_nu'] = 0.
+    if is_v4 or is_v5:
+        run['mean_mse'] = 0.
+        run['pred_mean_std'] = 0.
     if args.quantile_weight > 0:
         run['quantile_loss'] = 0.
     run_count = 0
@@ -480,15 +666,83 @@ def main():
     print("Starting pre-training (cross-attn + aux tasks + cond dropout)")
     print(f"{'='*60}\n")
 
+    _synth_iter = iter(_synth_loader) if (is_v4 and _synth_loader is not None) else None
+
     for epoch in range(start_epoch, args.epochs):
-        if not is_v3:
+        if not is_real:
             dataset.seed = args.seed + epoch * 1000
 
         for batch_idx, batch in enumerate(loader):
             lr = get_lr(global_step, args.warmup_steps, total_steps, args.lr, args.min_lr)
             set_lr(optimizer, lr)
 
-            if is_v3:
+            if is_v4 or is_v5:
+                # ── v4 multi-horizon curve path ──
+                x, y_curve, asset_labels, rv_labels = batch
+
+                # Merge synthetic batch if available
+                if _synth_loader is not None:
+                    try:
+                        sx, sy, sa, sr = next(_synth_iter)
+                    except (StopIteration, NameError):
+                        _synth_iter = iter(_synth_loader)
+                        sx, sy, sa, sr = next(_synth_iter)
+                    x = torch.cat([x, sx], dim=0)
+                    y_curve = torch.cat([y_curve, sy], dim=0)
+                    asset_labels = torch.cat([asset_labels, sa], dim=0)
+                    rv_labels = torch.cat([rv_labels, sr], dim=0)
+
+                x = x.to(device, non_blocking=True)
+                y_curve = y_curve.to(device, non_blocking=True)
+                asset_labels = asset_labels.to(device, non_blocking=True)
+                rv_labels = rv_labels.to(device, non_blocking=True)
+
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    enc_out = model.encode(x)
+
+                    if model.training and model.cfg.cond_drop_prob > 0:
+                        mask = torch.rand(x.size(0), 1, 1, device=enc_out.device) > model.cfg.cond_drop_prob
+                        enc_out_masked = enc_out * mask
+                    else:
+                        enc_out_masked = enc_out
+
+                    log_pi, mu, sigma, nu = model.decode_curve(enc_out_masked)
+
+                    from src.losses import combined_loss_v4
+                    loss_main, nll, crps_val, mean_mse = combined_loss_v4(
+                        log_pi, mu, sigma, y_curve, nu,
+                        nll_weight=args.nll_weight_v3,
+                        crps_weight=args.crps_weight_v3,
+                        mean_mse_weight=args.mean_mse_weight,
+                        horizon_weighting=args.horizon_weighting,
+                        min_mse_horizon=args.min_mse_horizon,
+                    )
+
+                    # Auxiliary: asset-type classifier + vol regressor
+                    _, vol_pred, asset_logits, _ = model.forward_auxiliary(x)
+                    loss_asset = F.cross_entropy(asset_logits, asset_labels)
+                    loss_vol = F.mse_loss(vol_pred, rv_labels)
+                    loss_aux = loss_asset + loss_vol
+                    loss = loss_main + args.asset_cls_weight * loss_aux
+
+                    if args.enc_var_weight > 0:
+                        from src.losses import encoder_variance_penalty
+                        loss = loss + args.enc_var_weight * encoder_variance_penalty(enc_out)
+
+                    loss = loss / args.grad_accum
+
+                # Track metrics for v4
+                primary = crps_val
+                sde_labels = asset_labels
+                sde_logits = asset_logits
+                yb = None
+                # Track pred_mean_std (key v4 metric)
+                with torch.no_grad():
+                    pi = log_pi.exp()
+                    pred_mean = (pi * mu).sum(dim=-1)  # (B, H)
+                    _pred_mean_std = pred_mean.std().item()
+
+            elif is_v3:
                 # ── v3 real data path ──
                 x, h, target, asset_labels, rv_labels = batch
                 x = x.to(device, non_blocking=True)
@@ -633,15 +887,18 @@ def main():
             run['loss_aux'] += loss_aux.item()
             run['ed'] += primary.item()
             run['nll'] += nll.item()
-            run['loss_sde'] += (loss_asset.item() if is_v3 else loss_sde.item())
+            run['loss_sde'] += (loss_asset.item() if (is_v3 or is_v4) else loss_sde.item())
             run['vol_mse'] += loss_vol.item()
             run['sde_acc'] += sde_acc
             run['mean_mu'] += mu.detach().abs().mean().item()
             run['mean_sigma'] += sigma.detach().mean().item()
             run['eff_k'] += eff_k
             run['grad_norm'] += grad_norm
-            if nu is not None and (args.use_student_t or is_v3):
+            if nu is not None and (args.use_student_t or is_real):
                 run['mean_nu'] = run.get('mean_nu', 0.) + nu.detach().mean().item()
+            if is_v4 or is_v5:
+                run['mean_mse'] = run.get('mean_mse', 0.) + mean_mse.item()
+                run['pred_mean_std'] = run.get('pred_mean_std', 0.) + _pred_mean_std
             run_count += 1
             global_step += 1
 
@@ -668,6 +925,9 @@ def main():
                 }
                 if 'mean_nu' in run and run['mean_nu'] != 0.:
                     metrics['mean_nu'] = run['mean_nu'] / run_count
+                if is_v4 and 'mean_mse' in run:
+                    metrics['mean_mse'] = run['mean_mse'] / run_count
+                    metrics['pred_mean_std'] = run['pred_mean_std'] / run_count
                 logger.log(metrics, step=global_step)
                 # Reset accumulators
                 for k in run:
@@ -675,7 +935,11 @@ def main():
                 run_count = 0
 
             if global_step % args.val_every == 0:
-                if is_v3:
+                if is_v4 or is_v5:
+                    val_m = validate_v4(model, val_x, val_y_curve, val_asset, val_rv,
+                                        device, args.nll_weight_v3, args.crps_weight_v3,
+                                        args.mean_mse_weight, args.horizon_weighting)
+                elif is_v3:
                     val_m = validate_v3(model, val_x, val_h, val_y, val_asset, val_rv,
                                         device, args.nll_weight_v3, args.crps_weight_v3)
                 else:

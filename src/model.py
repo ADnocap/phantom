@@ -82,6 +82,10 @@ class PhantomConfig:
     use_asset_classifier: bool = False  # Asset-type auxiliary classifier
     use_sign_classifier: bool = False   # Return-sign auxiliary classifier
 
+    # ── v4 additions (multi-horizon curve prediction) ──
+    max_horizon: int = 30              # Maximum horizon for embedding table
+    multi_horizon: bool = False        # Output full 1..max_horizon curve
+
     @property
     def n_patches(self) -> int:
         if self.patch_sizes is not None:
@@ -421,7 +425,7 @@ class PhantomModel(nn.Module):
             ])
 
         # Decoder (cross-attention or FiLM-conditioned)
-        self.horizon_embed = nn.Embedding(max(cfg.horizons) + 1, cfg.d_model)
+        self.horizon_embed = nn.Embedding(cfg.max_horizon + 1, cfg.d_model)
         if cfg.use_film:
             self.decoder_layers = nn.ModuleList([
                 FiLMDecoderLayer(cfg) for _ in range(cfg.n_decoder_layers)
@@ -503,13 +507,54 @@ class PhantomModel(nn.Module):
 
         return self.head(decoded)
 
-    def forward(self, x: torch.Tensor, horizon: torch.Tensor):
-        """
+    def decode_curve(self, enc_out: torch.Tensor):
+        """Decode distribution parameters for ALL horizons 1..max_horizon.
+
+        Uses batched cross-attention: 30 horizon queries attend to encoder
+        patches simultaneously in a single forward pass.
+
+        Args:
+            enc_out: (B, N, d_model) encoder patch representations.
         Returns:
-            log_pi: (B, K) log mixture weights.
-            mu:     (B, K) component means.
-            sigma:  (B, K) component stds/scales.
-            nu:     (B, K) degrees of freedom, or None for Gaussian.
+            log_pi: (B, H, K) log mixture weights per horizon.
+            mu:     (B, H, K) component means per horizon.
+            sigma:  (B, H, K) component scales per horizon.
+            nu:     (B, H, K) degrees of freedom, or None.
+        """
+        B = enc_out.size(0)
+        H = self.cfg.max_horizon  # 30
+
+        # Embed all horizons 1..H: (H, d_model) → (B, H, d_model)
+        h_indices = torch.arange(1, H + 1, device=enc_out.device)
+        query = self.horizon_embed(h_indices).unsqueeze(0).expand(B, -1, -1)
+
+        # Cross-attention decoder: (B, H, d_model) attends to (B, N, d_model)
+        for layer in self.decoder_layers:
+            query = layer(query, enc_out)
+
+        query = self.decoder_norm(query)  # (B, H, d_model)
+
+        # Head: flatten → forward → unflatten
+        decoded_flat = query.reshape(B * H, -1)  # (B*H, d_model)
+        head_out = self.head(decoded_flat)  # tuple of (B*H, K) tensors
+
+        log_pi = head_out[0].reshape(B, H, -1)
+        mu = head_out[1].reshape(B, H, -1)
+        sigma = head_out[2].reshape(B, H, -1)
+        nu = head_out[3].reshape(B, H, -1) if head_out[3] is not None else None
+
+        return log_pi, mu, sigma, nu
+
+    def forward(self, x: torch.Tensor, horizon: torch.Tensor = None):
+        """
+        Args:
+            x: (B, L) or (B, L, C) input features.
+            horizon: (B,) forecast horizon. None for multi-horizon curve output.
+
+        Returns (single horizon):
+            log_pi, mu, sigma, nu: each (B, K)
+        Returns (multi-horizon, horizon=None):
+            log_pi, mu, sigma, nu: each (B, H, K) where H=max_horizon
         """
         enc_out = self.encode(x)  # (B, N, d_model)
 
@@ -518,6 +563,8 @@ class PhantomModel(nn.Module):
             mask = torch.rand(x.size(0), 1, 1, device=enc_out.device) > self.cfg.cond_drop_prob
             enc_out = enc_out * mask
 
+        if self.cfg.multi_horizon and horizon is None:
+            return self.decode_curve(enc_out)
         return self.decode(enc_out, horizon)
 
     def forward_auxiliary(self, x: torch.Tensor):

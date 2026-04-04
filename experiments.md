@@ -129,19 +129,91 @@ All plateau at same ED. Problem is common to all configs.
 
 ---
 
+## Phase 9: v3 — Real Multi-Asset Pretraining
+
+**Motivation**: Synthetic SDEs can't teach temporal patterns. Pretrain on real financial data instead.
+
+**Setup**: 268 assets (36 crypto, 131 US equity, 31 ETFs, 45 EU equity, 15 forex, 10 commodity). 6-channel OHLCV features (returns, intraday range, body ratio, volume ratio, trailing vol, momentum). 1.56M train samples, 75-day context. NLL + CRPS loss on single targets. Asset-type classifier + vol regressor auxiliaries. Student-t head.
+
+**Data sources**: Binance + CryptoCompare (crypto), yfinance (equities, ETFs, forex, commodities). All free.
+
+| Metric | v3 Result |
+|--------|-----------|
+| NLL | -1.74 |
+| CRPS | 0.031 |
+| ECE | 0.009 |
+| Coverage 90% | 93.1% |
+| Corr(pred_std, \|error\|) | 0.50 |
+| Pred mean std | 0.0008 (collapsed) |
+| Corr(pred_mean, actual) | -0.012 |
+| Asset-type accuracy | 94% |
+
+**Key Finding**: Excellent **uncertainty calibration** across asset types (corr=0.50 — crypto gets wide sigma, forex gets narrow). But predicted mean is always ~0 — no directional signal from OHLCV features at 3-7 day horizons. The model correctly learns "I can't predict direction, so I'll get the spread right."
+
+---
+
+## Phase 10: v4 — Multi-Horizon Curve Prediction (1-30 days)
+
+**Motivation**: Longer horizons have better drift SNR (SNR ~ sqrt(h)). Predict full term structure of distributions.
+
+**Setup**: Same 268 assets, 120-day context (up from 75), 30 horizons (1-30 days). Model decodes all 30 horizons simultaneously via batched cross-attention queries. Added explicit MSE loss on predicted mean, weighted by sqrt(h/30). Initialized from v3 weights.
+
+### v4a (mean_mse_weight=1.0, no regularization)
+- Train pred_mean_std: 0.006 (growing — mu alive on training data)
+- **Val pred_mean_std: 0.0014 and declining** — mu predictions don't generalize
+- Val mean_mse: 0.018 (flat — no improvement on unseen data)
+- **Diagnosis**: Model memorizes training return directions but can't transfer to validation
+
+### v4b (mean_mse_weight=0.3, dropout=0.3, weight_decay=0.05, 15% synthetic GARCH/Momentum, min_mse_horizon=10)
+- Train pred_mean_std: 0.008 (higher with more regularization pressure)
+- **Val pred_mean_std: 0.001 — still collapsing**
+- Val mean_mse: 0.018 (identical to v4a — regularization didn't help)
+
+**Conclusion**: OHLCV price features do not contain generalizable directional signal at any horizon 1-30 days. The model can learn to memorize training return directions but this doesn't transfer. This is consistent with weak-form market efficiency. The mean MSE loss only causes overfitting.
+
+---
+
+## Phase 11: v5 — Relative Return Prediction (in progress)
+
+**Motivation**: Absolute returns are unpredictable from price features, but relative returns (asset vs peer group) might be. Shared market factors cancel, leaving idiosyncratic signal (volume surges, momentum divergence).
+
+**Setup**: Same 268 assets, 120-day context, 30 horizons. Target changed from absolute returns to relative: `Y_relative = Y_asset - mean(Y[same date, same class])`. Computed offline over 25,395 (date, class) groups. 99.7% of samples adjusted. Initialized from v3. mean_mse_weight=0.3, min_mse_horizon=5.
+
+**Key Evaluation Metrics** (new for v5):
+- **Rank IC**: Spearman correlation between predicted and actual relative returns, averaged across dates
+- **Long-short portfolio**: buy top quintile predicted, short bottom quintile — PnL
+- **IC by horizon**: which horizons have cross-sectional signal?
+
+**Status**: Dataset built, training submitted to LaRuche.
+
+**Expected outcome**: If Rank IC > 0.02 → genuine cross-sectional signal exists. If IC ≈ 0 → OHLCV features lack both absolute AND relative predictive power, and external features (macro, sentiment, on-chain) are needed.
+
+---
+
+## What Worked Across All Phases
+
+| Technique | Where | Impact |
+|-----------|-------|--------|
+| Real multi-asset data | v3+ | Much richer representations than synthetic SDEs |
+| 6-channel OHLCV features | v3+ | Universal across all asset types |
+| Student-t head | v2+ | Better than MoG, captures heavy tails |
+| Asset-type classifier | v3+ | 94%+ accuracy, forces encoder discrimination |
+| Uncertainty calibration | v3+ | Corr(pred_std, \|error\|) = 0.50 — real cross-asset knowledge |
+| Multi-horizon decoding | v4+ | Efficient batched 30-query cross-attention |
+| Relative return targets | v5 | TBD — tests cross-sectional predictability |
+
+## What Didn't Work
+
+| Technique | Why |
+|-----------|-----|
+| Mean MSE loss on absolute returns | Model memorizes training directions, doesn't generalize (v4a/v4b) |
+| Synthetic data mixing for regularization | Synthetic features are distinguishable from real (v4b) |
+| Higher dropout/weight decay | Doesn't fix the fundamental lack of directional signal (v4b) |
+| Longer horizons alone | SNR improves but still insufficient for absolute prediction (v4) |
+
 ## Next Steps
 
-### High Priority
-1. **Real multi-asset pretraining** — Pretrain on thousands of real time series (stocks, crypto, forex) instead of synthetic SDEs. This is what Chronos/TimesFM/Lag-Llama do. The synthetic approach fundamentally can't teach temporal patterns that exist in real markets.
-2. **Additional features** — On-chain data (MVRV, SOPR, exchange flows), cross-asset signals (S&P correlation, DXY, VIX). Pure price context may not have enough signal at 3-7 day horizons.
-3. **Longer horizons** — Try 14-30 day predictions where drift estimation has higher SNR (expected return grows linearly with time, noise grows with sqrt).
-
-### Medium Priority
-4. **Much longer context** — 200-365 days instead of 75. Monthly/quarterly patterns might emerge.
-5. **Smaller model** — 31M params for 7K BTC training samples is extreme. Try 1-5M param model to reduce overfitting.
-6. **Direct GARCH fitting** — Instead of learning distributions end-to-end, estimate GARCH(1,1) parameters from context and use them analytically.
-
-### Research Directions
-7. **Quantile regression head** — Replace distributional output with direct quantile predictions (what Moirai 2.0 and TempoPFN do).
-8. **Flow matching / diffusion head** — Replace parametric head with non-parametric learned distribution (what Sundial does).
-9. **Ensemble** — 5 models with different seeds, Vincentized quantile aggregation.
+1. **v5 results** — If Rank IC > 0.02, pursue relative return strategy (pair trading, cross-sectional alpha)
+2. **External features** — If v5 fails, add macro/sentiment/on-chain data for directional prediction
+3. **BTC fine-tuning** — Fine-tune best model on BTC with 6-channel features for distributional forecasting
+4. **Production deployment** — Package the volatility term structure model for risk/portfolio use

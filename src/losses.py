@@ -690,3 +690,86 @@ def combined_loss_v3(
         total = total + quantile_weight * ql
 
     return total, nll, crps
+
+
+# ── Combined Loss v4 (multi-horizon curve) ───────────────────────
+
+def combined_loss_v4(
+    log_pi: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    targets: torch.Tensor,
+    nu: torch.Tensor | None = None,
+    nll_weight: float = 1.0,
+    crps_weight: float = 0.5,
+    mean_mse_weight: float = 1.0,
+    horizon_weighting: str = 'sqrt',
+    crps_horizon_indices: list = [0, 4, 9, 14, 19, 24, 29],
+    min_mse_horizon: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Combined loss for v4 multi-horizon curve prediction.
+
+    Args:
+        log_pi: (B, H, K) log mixture weights per horizon.
+        mu:     (B, H, K) component means per horizon.
+        sigma:  (B, H, K) component scales per horizon.
+        targets: (B, H) cumulative returns at horizons 1..H.
+        nu:     (B, H, K) degrees of freedom, or None.
+        nll_weight: Weight for NLL term.
+        crps_weight: Weight for CRPS term.
+        mean_mse_weight: Weight for mean MSE supervision.
+        horizon_weighting: 'sqrt', 'linear', 'log', or 'uniform'.
+        crps_horizon_indices: Which horizon indices to compute CRPS on
+                              (default: {1,5,10,15,20,25,30} = indices 0,4,9,..,29).
+
+    Returns:
+        (total_loss, nll_term, crps_term, mean_mse_term) — all scalars.
+    """
+    B, H, K = mu.shape
+
+    # ── NLL on all horizons (flatten and use existing nll_loss) ──
+    nll = nll_loss(
+        log_pi.reshape(B * H, K),
+        mu.reshape(B * H, K),
+        sigma.reshape(B * H, K),
+        targets.reshape(B * H),
+        nu.reshape(B * H, K) if nu is not None else None,
+    )
+
+    # ── CRPS on subset of horizons ──
+    idx = [i for i in crps_horizon_indices if i < H]
+    if idx and crps_weight > 0:
+        crps = crps_loss(
+            log_pi[:, idx].reshape(B * len(idx), K),
+            mu[:, idx].reshape(B * len(idx), K),
+            sigma[:, idx].reshape(B * len(idx), K),
+            targets[:, idx].reshape(B * len(idx)),
+            nu[:, idx].reshape(B * len(idx), K) if nu is not None else None,
+        )
+    else:
+        crps = torch.zeros(1, device=mu.device)
+
+    # ── Mean MSE with horizon-dependent weighting ──
+    pi = log_pi.exp()                          # (B, H, K)
+    pred_mean = (pi * mu).sum(dim=-1)          # (B, H)
+
+    h_indices = torch.arange(1, H + 1, device=mu.device, dtype=mu.dtype)
+    if horizon_weighting == 'sqrt':
+        weights = torch.sqrt(h_indices / H)
+    elif horizon_weighting == 'linear':
+        weights = h_indices / H
+    elif horizon_weighting == 'log':
+        weights = torch.log1p(h_indices) / torch.log1p(torch.tensor(float(H), device=mu.device))
+    else:  # uniform
+        weights = torch.ones(H, device=mu.device)
+    # Zero out short horizons if min_mse_horizon is set
+    if min_mse_horizon > 0:
+        weights[:min_mse_horizon - 1] = 0.0
+    weights = weights / (weights.mean() + 1e-8)  # normalize so avg nonzero weight ~ 1
+
+    mse_per_horizon = (pred_mean - targets) ** 2  # (B, H)
+    mean_mse = (mse_per_horizon * weights.unsqueeze(0)).mean()
+
+    total = nll_weight * nll + crps_weight * crps + mean_mse_weight * mean_mse
+
+    return total, nll, crps, mean_mse
