@@ -2,12 +2,12 @@
 """
 Fetch equity/ETF/forex/commodity OHLCV data via yfinance.
 
-Saves one .npz per asset to data/raw/stooq/{asset_class}/{ticker}.npz
+Saves one .npz per asset to data/raw/yfinance/{asset_class}/{ticker}.npz
 
 Usage:
-  python scripts/data/fetch_stooq.py
-  python scripts/data/fetch_stooq.py --asset_class etf
-  python scripts/data/fetch_stooq.py --asset_class equity
+  python scripts/data/fetch_yfinance.py
+  python scripts/data/fetch_yfinance.py --asset_class etf
+  python scripts/data/fetch_yfinance.py --asset_class equity
 """
 
 import argparse
@@ -185,7 +185,7 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch OHLCV data via yfinance")
     parser.add_argument('--asset_class', type=str, default='all',
                         choices=['all', 'equity', 'etf', 'forex', 'commodity', 'eu_equity'])
-    parser.add_argument('--output_dir', type=str, default='data/raw/stooq')
+    parser.add_argument('--output_dir', type=str, default='data/raw/yfinance')
     parser.add_argument('--start_date', type=str, default='2000-01-01')
     args = parser.parse_args()
 

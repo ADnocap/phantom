@@ -131,14 +131,15 @@ def scan_raw_dir(raw_dir: Path) -> dict[str, list[Path]]:
         for f in sorted(crypto_dir.glob('*.npz')):
             assets_by_class['crypto'].append(f)
 
-    # Check for stooq subdirs
-    stooq_dir = raw_dir / 'stooq'
-    if stooq_dir.exists():
-        for subdir in sorted(stooq_dir.iterdir()):
-            if subdir.is_dir():
-                cls_name = subdir.name
-                for f in sorted(subdir.glob('*.npz')):
-                    assets_by_class[cls_name].append(f)
+    # Check for yfinance (or legacy stooq) subdirs
+    for parent_name in ['yfinance', 'stooq']:
+        yf_dir = raw_dir / parent_name
+        if yf_dir.exists():
+            for subdir in sorted(yf_dir.iterdir()):
+                if subdir.is_dir():
+                    cls_name = subdir.name
+                    for f in sorted(subdir.glob('*.npz')):
+                        assets_by_class[cls_name].append(f)
 
     return dict(assets_by_class)
 
@@ -233,7 +234,7 @@ def main():
     assets_by_class = scan_raw_dir(raw_dir)
 
     if not assets_by_class:
-        print("ERROR: No data found. Run fetch_crypto.py and/or fetch_stooq.py first.")
+        print("ERROR: No data found. Run fetch_crypto.py and/or fetch_yfinance.py first.")
         return
 
     for cls, files in assets_by_class.items():
