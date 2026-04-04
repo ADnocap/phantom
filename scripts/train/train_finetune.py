@@ -240,7 +240,7 @@ def parse_args():
                    help='Initial real fraction (when annealing)')
     p.add_argument('--end_real_fraction', type=float, default=0.7,
                    help='Final real fraction (when annealing)')
-    p.add_argument('--sde_version', type=str, default='v1', choices=['v1', 'v2'],
+    p.add_argument('--sde_version', type=str, default='v1', choices=['v1', 'v2', 'v3'],
                    help='SDE family version for synthetic data during fine-tuning')
 
     return p.parse_args()
