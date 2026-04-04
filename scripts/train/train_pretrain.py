@@ -887,7 +887,7 @@ def main():
             run['loss_aux'] += loss_aux.item()
             run['ed'] += primary.item()
             run['nll'] += nll.item()
-            run['loss_sde'] += (loss_asset.item() if (is_v3 or is_v4) else loss_sde.item())
+            run['loss_sde'] += (loss_asset.item() if is_real else loss_sde.item())
             run['vol_mse'] += loss_vol.item()
             run['sde_acc'] += sde_acc
             run['mean_mu'] += mu.detach().abs().mean().item()
@@ -925,7 +925,7 @@ def main():
                 }
                 if 'mean_nu' in run and run['mean_nu'] != 0.:
                     metrics['mean_nu'] = run['mean_nu'] / run_count
-                if is_v4 and 'mean_mse' in run:
+                if (is_v4 or is_v5) and 'mean_mse' in run:
                     metrics['mean_mse'] = run['mean_mse'] / run_count
                     metrics['pred_mean_std'] = run['pred_mean_std'] / run_count
                 logger.log(metrics, step=global_step)
