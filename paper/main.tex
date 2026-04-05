@@ -71,27 +71,28 @@ Through systematic ablation across eight model versions, we establish that the c
 
 \section{Introduction}
 
-[TO FILL: Opening on crypto cross-sectional prediction opportunity.
-Cite Liu et al. (2022) three-factor model, Fieberg et al. (2024) CTREND.
-Contrast with equity literature. Emphasize 24/7 trading, high volatility,
-market inefficiency relative to equities.]
+The cryptocurrency market, with a combined capitalization exceeding \$2 trillion and continuous 24/7 trading across hundreds of liquid assets, presents a distinctive opportunity for cross-sectional return prediction.
+Unlike directional forecasting---predicting whether an asset's price will rise or fall---cross-sectional prediction concerns the simpler but economically powerful task of \emph{ranking}: identifying which assets will outperform or underperform their peers over a given horizon.
+Recent work has established that cross-sectional factors familiar from equity markets, including momentum~\cite{liu2022}, size, and volume, carry significant premia in cryptocurrency~\cite{fieberg2024}.
+However, existing approaches rely exclusively on point forecasts, discarding the distributional information that is critical for position sizing, risk management, and tail-risk awareness in a market characterized by heavy tails, extreme volatility clustering, and frequent regime shifts.
 
-[TO FILL: Gap --- no distributional cross-sectional models exist.
-Point forecasts discard uncertainty information critical for position
-sizing and risk management. Student-t captures heavy tails that
-Gaussian models miss.]
+This paper addresses a gap at the intersection of distributional forecasting and cross-sectional prediction.
+While probabilistic time series models such as DeepAR and Temporal Fusion Transformers produce predictive distributions for individual assets, they are not designed for cross-sectional ranking.
+Conversely, cross-sectional factor models~\cite{liu2022,fieberg2024} produce rankings but provide no uncertainty quantification.
+Distributional foundation models such as JointFM~\cite{hackmann2026} have shown that Transformer architectures can recover complex distributional structure from time series, but have only been evaluated on synthetic data with no demonstrated cross-sectional signal on real financial assets.
+We bridge these approaches.
 
-[TO FILL: Our approach. Phantom: Transformer encoder-decoder,
-Student-t output head, trained on relative returns across 362 crypto
-assets. Multi-horizon simultaneous prediction (1-30 days).]
+We present \textbf{Phantom}, a Transformer-based model that predicts calibrated Student-$t$ distributions of cross-sectional \emph{relative} returns across 362 cryptocurrencies at horizons of 1--30 days simultaneously.
+The architecture consists of a patched Transformer encoder that processes 120 days of 6-channel OHLCV features, a cross-attention decoder that queries all 30 horizons in a single forward pass, and a Student-$t$ output head with 3 parameters per horizon (location $\mu$, scale $\sigma$, degrees of freedom $\nu$).
+The model is trained on cross-sectionally demeaned returns---each asset's return minus the same-day cross-sectional mean---which removes shared market factors and isolates the idiosyncratic signal that drives relative performance.
 
-[TO FILL: Key results. IC=0.124 (NW t=8.93), Sharpe 11.84 net of
-30 bps, win rate 74.7\%, perfect decile monotonicity. All fully OOS
-on 15 months of data.]
+On 15 months of fully out-of-sample data (January 2025 to March 2026, 430 trading days), Phantom achieves a rank information coefficient (IC) of 0.124 at the 10-day horizon (Newey-West $t = 8.93$), increasing to 0.166 at 30 days.
+A long-short portfolio that buys the top quintile and shorts the bottom quintile earns a Sharpe ratio of 11.84 after 30 basis points of transaction costs per trade, with a 74.7\% daily win rate, perfect decile return monotonicity (Spearman $\rho = 1.0$), and IC positive in all 15 out-of-sample months.
+The strategy's breakeven transaction cost is 336 basis points, providing substantial headroom above typical exchange fees.
 
-[TO FILL: Ablation narrative. Eight versions systematically test:
-synthetic vs real pretraining, absolute vs relative returns,
-additional features, data granularity, universe breadth.]
+These results emerge from a systematic search over the design space, spanning eight model versions.
+We show that (i)~synthetic pretraining on stochastic differential equations achieves oracle distributional accuracy but transfers zero signal to real data; (ii)~absolute returns are unpredictable from OHLCV features at any horizon, consistent with weak-form market efficiency; (iii)~\emph{relative} returns unlock cross-sectional signal concentrated in the cryptocurrency market; (iv)~derivative market features (funding rates, taker buy volume) provide no incremental IC; (v)~higher-frequency (4-hour) data degrades performance due to massive sample overlap; and (vi)~widening the asset universe from 60 to 362 cryptocurrencies doubles the Sharpe ratio.
+Each negative result eliminates a plausible design choice and contributes to the understanding of where cross-sectional signal resides in cryptocurrency markets.
 
 \paragraph{Contributions.}
 \begin{itemize}
@@ -141,36 +142,45 @@ additional features, data granularity, universe breadth.]
 \section{Related Work}
 
 \subsection{Cross-Sectional Cryptocurrency Factors}
-[TO FILL: Liu et al. 2022 --- CMKT, CSMB, CMOM factors. Momentum
-dominant but declining. Fieberg et al. 2024 --- CTREND aggregates
-28 technical signals. BIS WP 1087 --- carry from funding rates.
-Low-vol anomaly in crypto.]
+
+Liu, Tsyvinski, and Wu~\cite{liu2022} establish a three-factor model for cryptocurrency returns comprising market (CMKT), size (CSMB), and momentum (CMOM) factors, constructed analogously to the Fama-French framework for equities.
+Momentum emerges as the dominant cross-sectional predictor, with weekly long-short returns and $t$-statistics well above~3, substantially exceeding the momentum premium observed in equity markets.
+Their work demonstrates that standard asset pricing methodology transfers to the crypto asset class, though the factor zoo is far smaller than in equities.
+Fieberg et al.~\cite{fieberg2024} extend this line of work by constructing CTREND, a composite trend factor that aggregates momentum and moving-average crossover signals across multiple lookback horizons.
+CTREND subsumes any individual momentum measure and earns significant alpha over the three-factor model, demonstrating that multi-horizon trend aggregation is more informative than any single-horizon signal.
+
+The low-volatility anomaly---whereby low-volatility assets earn higher risk-adjusted returns than high-volatility ones---is well-documented in equities~\cite{ang2006} and has been observed in cryptocurrency markets, where the retail-dominated investor base and lottery-like preferences for high-volatility tokens provide a natural explanation.
+Our double-sort analysis (Section~5.4) reveals substantial interaction between our model's signal and the low-volatility effect.
+
+All existing cross-sectional crypto studies produce point forecasts: they rank assets by a scalar signal and evaluate via portfolio sorts.
+None provides distributional predictions that quantify the \emph{uncertainty} of the ranking, which is essential for position sizing and risk management.
 
 \subsection{Transformer-Based Time Series Forecasting}
-[TO FILL: PatchTST patched input, channel-independence. iTransformer
-inverts attention. Chronos tokenized forecasting. JointFM synthetic
-SDE distributional prediction. Our architecture closest to PatchTST
-but with cross-attention decoder for multi-horizon + Student-t head.]
+
+Nie et al.~\cite{nie2023} introduce PatchTST, which segments time series into subseries-level patches before applying a Transformer encoder, reducing sequence length while capturing local semantic information.
+Their finding that channel-independent processing outperforms channel mixing on standard benchmarks provides a foundation for our patched encoder design, though we depart from channel independence by jointly embedding all six OHLCV features within each patch, as cross-channel interactions (e.g., between returns and volume) are central to our prediction task.
+Ansari et al.~\cite{ansari2024} propose Chronos, a time series foundation model that tokenizes real-valued observations into discrete bins and trains a T5-based language model on a large corpus of diverse time series, enabling zero-shot probabilistic forecasting across domains.
+While both PatchTST and Chronos advance time series forecasting, neither is designed for cross-sectional ranking or the heavy-tailed distributional properties specific to financial returns.
 
 \subsection{Distributional Foundation Models}
-[TO FILL: JointFM (Hackmann 2026) --- closest related work.
-Transformer with Variable-Factored Attention for multivariate
-distributional prediction on synthetic SDEs. Achieves oracle
-energy distance recovery. Key differences from Phantom:
-(1) JointFM predicts absolute process levels, not relative returns;
-(2) multivariate joint distributions (N=10 coupled targets) vs
-our univariate per-asset; (3) evaluated only on synthetic data,
-no real financial data or cross-sectional metrics.
-Phantom extends the JointFM paradigm to real cross-sectional
-prediction and demonstrates actual OOS signal.
-Also mention DeepAR, TFT as probabilistic forecasting baselines.]
+
+Most closely related to our work, Hackmann~\cite{hackmann2026} proposes JointFM, a foundation model for multivariate distributional time series forecasting.
+JointFM uses Variable-Factored Attention to model both temporal and cross-variable dependencies and employs parametric distributional heads---multivariate Gaussian mixtures and multivariate Skewed Student-$t$ distributions---to produce full joint predictive distributions over multiple coupled targets.
+Trained on synthetic data generated from stochastic differential equations (GBM, Merton jump-diffusion, Bates stochastic volatility, regime-switching), JointFM achieves strong distributional calibration as measured by energy distance~\cite{szekely2013}.
+However, JointFM remains evaluated \emph{exclusively} on synthetic processes and does not address real financial data, leaving open the question of whether synthetic pretraining transfers to actual asset returns.
+Our work answers this question directly: through systematic comparison of synthetic and real-data pretraining (Section~5.7), we find that synthetic SDE pretraining achieves oracle distributional accuracy on synthetic test data but transfers zero cross-sectional signal to real cryptocurrency markets.
+Phantom extends the distributional forecasting paradigm to real cross-sectional prediction with demonstrated out-of-sample signal.
 
 \subsection{Probabilistic Forecasting}
-[TO FILL: CRPS as proper scoring rule (Gneiting \& Raftery 2007).
-Student-t vs Gaussian vs mixture heads. Energy distance.
-Why parametric (Student-t) is better than quantile regression for
-financial applications --- closed-form density enables NLL training,
-tail risk quantification, and position sizing.]
+
+Distributional forecasting of financial returns has a long history, from GARCH-family models to deep learning approaches including DeepAR and Temporal Fusion Transformers.
+We evaluate distributional quality using the Continuous Ranked Probability Score (CRPS), a strictly proper scoring rule defined as
+$\text{CRPS}(F, y) = \mathbb{E}_F|X - y| - \tfrac{1}{2}\mathbb{E}_F|X - X'|$
+where $X, X'$ are independent draws from the predictive distribution~$F$ and $y$ is the realized value~\cite{gneiting2007}.
+Strict propriety ensures that the score is uniquely minimized when the forecaster reports the true conditional distribution, providing a principled training and evaluation objective.
+
+We parameterize predictive distributions as Student-$t(\mu, \sigma, \nu)$ rather than Gaussian for two reasons: (i)~cryptocurrency returns exhibit substantial excess kurtosis even at multi-day horizons, and (ii)~the degrees-of-freedom parameter $\nu$ provides an adaptive, learnable measure of tail heaviness per asset and horizon.
+Our finding that the model consistently pushes $\nu \to 2$ (the minimum for finite variance) confirms that heavy-tailed modeling is essential for this asset class and that Gaussian assumptions are inadequate.
 
 % ═══════════════════════════════════════════════════════════════
 % 3. METHODOLOGY (~2 pages)
@@ -473,6 +483,11 @@ W.~K. Newey and K.~D. West.
 G.~J. Sz{\'e}kely and M.~L. Rizzo.
 \newblock Energy statistics: A class of statistics based on distances.
 \newblock {\em Journal of Statistical Planning and Inference}, 143(8):1249--1272, 2013.
+
+\bibitem{ang2006}
+A.~Ang, R.~J. Hodrick, Y.~Xing, and X.~Zhang.
+\newblock The cross-section of volatility and expected returns.
+\newblock {\em Journal of Finance}, 61(1):259--299, 2006.
 
 \bibitem{kim2022}
 T.~Kim, J.~Kim, Y.~Tae, C.~Park, J.~Choi, and J.~Choo.
