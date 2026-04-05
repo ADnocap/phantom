@@ -392,7 +392,71 @@ The failure reveals that **data quantity ≠ information quantity** when samples
 
 ---
 
-## What Worked Across All Phases (updated)
+## Phase 14: v8 — Wider Crypto Cross-Section (complete, best model)
+
+**Motivation**: v6 had only 60 crypto assets. More assets = better cross-sectional demeaning, more diverse patterns, better L/S diversification. Back to 6 OHLCV channels (v6 proved new features don't help), daily bars (v7 proved 4h is worse).
+
+**Setup**: 362 crypto assets (all active Binance USDT pairs, filtered stablecoins/leveraged tokens). 6 OHLCV channels, 120-day context, 30 horizons. Init from v5 checkpoint (6 channels, exact weight transfer). Two training runs: 50 epochs + resumed for 100 more (150 total, 67K steps).
+
+**Dataset**: 230K train / 97K val / 145K test from 362 crypto assets.
+
+### v8 Results (OOS: 2025-01 to 2026-03, 144,630 samples, 362 assets)
+
+**best.pt (step 24,000, best val loss -0.809):**
+
+| Metric | v6 (60 assets) | v8 best (362 assets) | Change |
+|--------|---------------|---------------------|--------|
+| **Rank IC (1d)** | 0.065 | **0.080** | +0.015 |
+| **Rank IC (5d)** | 0.114 | 0.112 | -0.002 |
+| **Rank IC (10d)** | 0.140 | **0.124** | -0.016 |
+| **Rank IC (15d)** | 0.154 | 0.133 | -0.021 |
+| **Rank IC (30d)** | 0.190 | 0.166 | -0.024 |
+| **L/S Sharpe** | 5.46 | **10.80** | **+5.34** |
+| **L/S Cumulative** | 831% | **1090%** | **+259%** |
+| **Win Rate** | 65% | **74.7%** | **+9.7%** |
+| Pred mean std | 0.0040 | 0.0048 | +0.0008 |
+| Corr(mean, actual) | 0.062 | **0.092** | **+0.030** |
+| Corr(std, \|error\|) | 0.170 | 0.162 | -0.008 |
+| NLL | -1.081 | -0.916 | +0.165 |
+| Coverage 50% | 51.2% | 47.7% | -3.5% |
+| Coverage 90% | 92.0% | 90.3% | -1.7% |
+| IC t-stat (10d) | ~13.1 | **17.2** | +4.1 |
+
+**latest.pt (step 67,248, highest mu spread):**
+
+| Metric | v8 best | v8 latest | Interpretation |
+|--------|---------|-----------|----------------|
+| Rank IC (1d) | 0.080 | **0.095** | Latest better at short horizons |
+| Rank IC (10d) | **0.124** | 0.115 | Best better at medium horizons |
+| Rank IC (30d) | **0.166** | 0.138 | Best better at long horizons |
+| L/S Sharpe | **10.80** | 10.37 | Similar |
+| Win Rate | 74.7% | **74.9%** | Similar |
+| Pred mean std | 0.0048 | **0.0086** | Latest has more mu variation |
+| Corr(mean, actual) | 0.092 | **0.096** | Latest slightly better conditional signal |
+| Coverage 90% | 90.3% | **92.5%** | Latest better calibrated |
+
+### Key Findings
+
+1. **L/S Sharpe doubled (5.46→10.80)** — wider cross-section (362 vs 60 assets) provides massive diversification within each leg. Sharpe scales with sqrt(N_assets).
+2. **Win rate jumped to 75%** — 3 out of 4 days the model correctly ranks the top/bottom quintiles. Strongest result across all versions.
+3. **IC decreased slightly at 10-30d** compared to v6 — the 362-asset universe includes many small/illiquid coins with noisy returns, which drags down average IC. But the L/S strategy benefits more from diversification than it loses from lower IC.
+4. **Corr(mean, actual) nearly doubled (0.062→0.092)** — the model produces genuinely predictive means, not just good rankings.
+5. **Continued training improves mu spread** — latest.pt has 2x the pred_mean_std of best.pt and slightly better conditional correlation. Val loss plateaued but cross-sectional signal kept improving. Val loss is not the right metric for this task.
+6. **Calibration held** — coverage 90%→90.3%, no degradation despite crypto-only training.
+7. **The Sharpe of 10.80 is pre-cost** — with 362 assets and daily rebalancing, transaction costs would be significant. Needs cost analysis.
+
+### v8 vs All Previous Versions
+
+| Version | Assets | IC (10d) | L/S Sharpe | Key change |
+|---------|--------|----------|------------|------------|
+| v5 | 413 (all) | 0.092 | 4.55 | Relative returns |
+| v6 | 60 (crypto) | 0.140 | 5.46 | Crypto-only |
+| v7 | 60 (crypto, 4h) | 0.095 | 2.61 | 4h bars (failed) |
+| **v8** | **362 (crypto)** | **0.124** | **10.80** | **Wider cross-section** |
+
+---
+
+## What Worked Across All Phases (final)
 
 | Technique | Where | Impact |
 |-----------|-------|--------|
@@ -403,24 +467,22 @@ The failure reveals that **data quantity ≠ information quantity** when samples
 | Uncertainty calibration | v3+ | Corr(pred_std, \|error\|) = 0.50 — real cross-asset knowledge |
 | Multi-horizon decoding | v4+ | Efficient batched 30-query cross-attention |
 | Relative return targets | v5+ | IC=0.09 cross-sectional signal from OHLCV |
-| **Crypto-only training** | **v6** | **IC 0.14→0.19 at 30d — removing non-crypto noise boosts signal** |
+| Crypto-only training | v6+ | Removing non-crypto noise boosts signal |
+| **Wider crypto cross-section** | **v8** | **362 assets: Sharpe 5.46→10.80, win rate 65%→75%** |
 
-## What Didn't Work (updated)
+## What Didn't Work (final)
 
 | Technique | Why |
 |-----------|-----|
-| Mean MSE loss on absolute returns | Model memorizes training directions, doesn't generalize (v4a/v4b) |
-| Synthetic data mixing for regularization | Synthetic features are distinguishable from real (v4b) |
-| Higher dropout/weight decay | Doesn't fix the fundamental lack of directional signal (v4b) |
-| Longer horizons alone | SNR improves but still insufficient for absolute prediction (v4) |
-| Absolute return prediction from OHLCV | Weak-form EMH holds — no directional signal at any horizon 1-30d (v3, v4) |
-| Taker buy ratio + funding rate features | No measurable IC contribution (delta < 0.002). OHLCV already captures the signal (v6) |
-| Open interest | Binance free API only provides 30 days of history — infeasible (v6) |
-| **4h bar granularity** | **Worse IC (0.14→0.095), massive sample overlap (99.7%), signal is daily-scale (v7)** |
+| Synthetic SDE pretraining | Oracle CRPS on synthetic but zero transfer to real data (v1/v2) |
+| Mean MSE loss on absolute returns | Model memorizes training directions, doesn't generalize (v4) |
+| Absolute return prediction from OHLCV | Weak-form EMH holds — no directional signal at any horizon (v3, v4) |
+| Taker buy ratio + funding rate features | No measurable IC contribution. OHLCV already captures the signal (v6) |
+| Open interest | Binance free API only provides 30 days of history (v6) |
+| 4h bar granularity | Sample overlap (99.7%), signal is daily-scale, worse IC (v7) |
 
 ## Next Steps
 
-1. **Transaction cost analysis** — v6 Sharpe of 5.46 is pre-cost. Need realistic estimates.
-2. **More crypto assets** — expand beyond 60 to 100+ assets (more exchanges, smaller caps) at daily resolution
-3. **Calibration recovery** — v6 coverage degraded vs v5. Post-hoc recalibration or calibration loss term.
-4. **Publication** — Write up v1→v7 progression. Key story: synthetic→real→relative→crypto-focused. v7 failure is a useful negative result (data quantity ≠ information).
+1. **Transaction cost analysis** — v8 Sharpe of 10.80 is pre-cost. Essential before claiming tradability.
+2. **Baseline comparisons** — momentum, mean-reversion, volume strategies for publication.
+3. **Publication** — v1→v8 progression is a complete paper. Submit to ICAIF or NeurIPS Financial ML workshop.

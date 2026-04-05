@@ -1,0 +1,87 @@
+=== Evaluating best.pt (step 24000, best val loss) ===
+Checkpoint: step 24,000, best_val_loss: -0.8087
+Test set: 144,630 samples
+  Crypto: 144630 (100.0%)
+  Unique dates: 430
+Computing predictions...
+  Batch 1/142  Batch 2/142  Batch 3/142  Batch 4/142  Batch 5/142  Batch 6/142  Batch 7/142  Batch 8/142  Batch 9/142  Batch 10/142  Batch 11/142  Batch 12/142  Batch 13/142  Batch 14/142  Batch 15/142  Batch 16/142  Batch 17/142  Batch 18/142  Batch 19/142  Batch 20/142  Batch 21/142  Batch 22/142  Batch 23/142  Batch 24/142  Batch 25/142  Batch 26/142  Batch 27/142  Batch 28/142  Batch 29/142  Batch 30/142  Batch 31/142  Batch 32/142  Batch 33/142  Batch 34/142  Batch 35/142  Batch 36/142  Batch 37/142  Batch 38/142  Batch 39/142  Batch 40/142  Batch 41/142  Batch 42/142  Batch 43/142  Batch 44/142  Batch 45/142  Batch 46/142  Batch 47/142  Batch 48/142  Batch 49/142  Batch 50/142  Batch 51/142  Batch 52/142  Batch 53/142  Batch 54/142  Batch 55/142  Batch 56/142  Batch 57/142  Batch 58/142  Batch 59/142  Batch 60/142  Batch 61/142  Batch 62/142  Batch 63/142  Batch 64/142  Batch 65/142  Batch 66/142  Batch 67/142  Batch 68/142  Batch 69/142  Batch 70/142  Batch 71/142  Batch 72/142  Batch 73/142  Batch 74/142  Batch 75/142  Batch 76/142  Batch 77/142  Batch 78/142  Batch 79/142  Batch 80/142  Batch 81/142  Batch 82/142  Batch 83/142  Batch 84/142  Batch 85/142  Batch 86/142  Batch 87/142  Batch 88/142  Batch 89/142  Batch 90/142  Batch 91/142  Batch 92/142  Batch 93/142  Batch 94/142  Batch 95/142  Batch 96/142  Batch 97/142  Batch 98/142  Batch 99/142  Batch 100/142  Batch 101/142  Batch 102/142  Batch 103/142  Batch 104/142  Batch 105/142  Batch 106/142  Batch 107/142  Batch 108/142  Batch 109/142  Batch 110/142  Batch 111/142  Batch 112/142  Batch 113/142  Batch 114/142  Batch 115/142  Batch 116/142  Batch 117/142  Batch 118/142  Batch 119/142  Batch 120/142  Batch 121/142  Batch 122/142  Batch 123/142  Batch 124/142  Batch 125/142  Batch 126/142  Batch 127/142  Batch 128/142  Batch 129/142  Batch 130/142  Batch 131/142  Batch 132/142  Batch 133/142  Batch 134/142  Batch 135/142  Batch 136/142  Batch 137/142  Batch 138/142  Batch 139/142  Batch 140/142  Batch 141/142  Batch 142/142
+Pred mean: range [-0.0895, -0.0024], std=0.0072
+Sigma: range [0.0119, 0.2818]
+Computing losses...
+NLL: -0.9155
+
+Coverage (h=10d):
+  50%: 47.7%
+  80%: 79.2%
+  90%: 90.3%
+  95%: 95.7%
+
+Rank IC by horizon:
+  h= 1d: IC=0.0801 +/- 0.2014 (n=430 dates)
+  h= 5d: IC=0.1121 +/- 0.1661 (n=430 dates)
+  h=10d: IC=0.1240 +/- 0.1498 (n=430 dates)
+  h=15d: IC=0.1333 +/- 0.1432 (n=430 dates)
+  h=20d: IC=0.1496 +/- 0.1399 (n=430 dates)
+  h=25d: IC=0.1573 +/- 0.1384 (n=430 dates)
+  h=30d: IC=0.1657 +/- 0.1356 (n=430 dates)
+
+Rank IC by asset class (h=10d):
+  Crypto: IC=0.1240 +/- 0.1498 (n=430)
+
+Long-short (h=10d, top/bottom 20%):
+  Mean daily: 2.536%
+  Sharpe: 10.80
+  Cumulative: 1090.3%
+  Win rate: 74.7%
+
+Conditional signal (h=10d):
+  Pred mean std: 0.0048
+  Corr(pred_mean, actual): 0.0923
+  Corr(pred_std, |error|): 0.1619
+
+Saved plots/eval_v8_best.png
+
+=== Evaluating latest.pt (final step, highest mu spread) ===
+Checkpoint: step 67,248, best_val_loss: -0.8087
+Test set: 144,630 samples
+  Crypto: 144630 (100.0%)
+  Unique dates: 430
+Computing predictions...
+  Batch 1/142  Batch 2/142  Batch 3/142  Batch 4/142  Batch 5/142  Batch 6/142  Batch 7/142  Batch 8/142  Batch 9/142  Batch 10/142  Batch 11/142  Batch 12/142  Batch 13/142  Batch 14/142  Batch 15/142  Batch 16/142  Batch 17/142  Batch 18/142  Batch 19/142  Batch 20/142  Batch 21/142  Batch 22/142  Batch 23/142  Batch 24/142  Batch 25/142  Batch 26/142  Batch 27/142  Batch 28/142  Batch 29/142  Batch 30/142  Batch 31/142  Batch 32/142  Batch 33/142  Batch 34/142  Batch 35/142  Batch 36/142  Batch 37/142  Batch 38/142  Batch 39/142  Batch 40/142  Batch 41/142  Batch 42/142  Batch 43/142  Batch 44/142  Batch 45/142  Batch 46/142  Batch 47/142  Batch 48/142  Batch 49/142  Batch 50/142  Batch 51/142  Batch 52/142  Batch 53/142  Batch 54/142  Batch 55/142  Batch 56/142  Batch 57/142  Batch 58/142  Batch 59/142  Batch 60/142  Batch 61/142  Batch 62/142  Batch 63/142  Batch 64/142  Batch 65/142  Batch 66/142  Batch 67/142  Batch 68/142  Batch 69/142  Batch 70/142  Batch 71/142  Batch 72/142  Batch 73/142  Batch 74/142  Batch 75/142  Batch 76/142  Batch 77/142  Batch 78/142  Batch 79/142  Batch 80/142  Batch 81/142  Batch 82/142  Batch 83/142  Batch 84/142  Batch 85/142  Batch 86/142  Batch 87/142  Batch 88/142  Batch 89/142  Batch 90/142  Batch 91/142  Batch 92/142  Batch 93/142  Batch 94/142  Batch 95/142  Batch 96/142  Batch 97/142  Batch 98/142  Batch 99/142  Batch 100/142  Batch 101/142  Batch 102/142  Batch 103/142  Batch 104/142  Batch 105/142  Batch 106/142  Batch 107/142  Batch 108/142  Batch 109/142  Batch 110/142  Batch 111/142  Batch 112/142  Batch 113/142  Batch 114/142  Batch 115/142  Batch 116/142  Batch 117/142  Batch 118/142  Batch 119/142  Batch 120/142  Batch 121/142  Batch 122/142  Batch 123/142  Batch 124/142  Batch 125/142  Batch 126/142  Batch 127/142  Batch 128/142  Batch 129/142  Batch 130/142  Batch 131/142  Batch 132/142  Batch 133/142  Batch 134/142  Batch 135/142  Batch 136/142  Batch 137/142  Batch 138/142  Batch 139/142  Batch 140/142  Batch 141/142  Batch 142/142
+Pred mean: range [-0.1170, 0.0062], std=0.0115
+Sigma: range [0.0102, 0.4472]
+Computing losses...
+NLL: -0.9165
+
+Coverage (h=10d):
+  50%: 52.1%
+  80%: 83.1%
+  90%: 92.5%
+  95%: 96.8%
+
+Rank IC by horizon:
+  h= 1d: IC=0.0947 +/- 0.1922 (n=430 dates)
+  h= 5d: IC=0.1094 +/- 0.1528 (n=430 dates)
+  h=10d: IC=0.1145 +/- 0.1425 (n=430 dates)
+  h=15d: IC=0.1200 +/- 0.1353 (n=430 dates)
+  h=20d: IC=0.1267 +/- 0.1308 (n=430 dates)
+  h=25d: IC=0.1295 +/- 0.1263 (n=430 dates)
+  h=30d: IC=0.1383 +/- 0.1236 (n=430 dates)
+
+Rank IC by asset class (h=10d):
+  Crypto: IC=0.1145 +/- 0.1425 (n=430)
+
+Long-short (h=10d, top/bottom 20%):
+  Mean daily: 2.393%
+  Sharpe: 10.37
+  Cumulative: 1029.2%
+  Win rate: 74.9%
+
+Conditional signal (h=10d):
+  Pred mean std: 0.0086
+  Corr(pred_mean, actual): 0.0961
+  Corr(pred_std, |error|): 0.2157
+
+Saved plots/eval_v8_latest.png
+
+=== Both evals complete ===
