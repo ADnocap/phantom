@@ -350,9 +350,77 @@ The v5→v6 gain is a **data composition effect**, not a feature effect. By remo
 | **Taker buy ratio + funding rate features** | **No measurable IC contribution (delta < 0.002). OHLCV already captures the signal (v6)** |
 | **Open interest** | **Binance free API only provides 30 days of history — infeasible (v6)** |
 
+## Phase 13: v7 — 4h Granularity (complete, failed)
+
+**Motivation**: v6 only had 80K train samples. 4h bars give 6x more data (476K). Drop taker buy + funding rate (didn't help), go back to 6 OHLCV channels.
+
+**Setup**: Crypto-only (60 assets), 6 OHLCV channels, 4h bars. 720-bar context (120 days), 90 horizons (4h to 15 days). patch_len=10 (72 patches). Init encoder/decoder/head from v5, re-init patch_embed + pos_enc + expand horizon_embed. Single-phase training, early stopping patience=10.
+
+**Dataset**: 476K train / 125K val / 143K test from 60 crypto assets.
+
+### v7 Results (step 5,000, early stopped, OOS: 2025-01 to 2026-03, 143K samples)
+
+| Metric | v6 (daily, best) | v7 (4h) | Change |
+|--------|-----------------|---------|--------|
+| **Rank IC (1d)** | 0.065 | 0.056 | -0.009 |
+| **Rank IC (10d)** | 0.140 | **0.095** | **-0.045** |
+| **Rank IC (15d)** | 0.154 | **0.102** | **-0.052** |
+| **L/S Sharpe (10d)** | 5.46 | **2.61** | **-2.85** |
+| **L/S Cumul (10d)** | 831% | 383% | -448% |
+| **Win Rate (10d)** | 65% | 60% | -5% |
+| Pred mean std | 0.0040 | 0.0021 | -0.0019 |
+| Corr(mean, actual) | 0.062 | 0.004 | -0.058 |
+| Corr(std, \|error\|) | 0.170 | 0.202 | +0.032 |
+| NLL | -1.081 | -1.446 | -0.365 |
+| Coverage 50% | 51.2% | 43.6% | -7.6% |
+| Coverage 90% | 92.0% | 88.3% | -3.7% |
+| L/S Sharpe (1d) | — | 0.99 | — |
+
+### Key Findings
+
+1. **4h granularity is significantly worse than daily** — IC dropped from 0.14 to 0.095 at 10d, Sharpe from 5.46 to 2.61.
+2. **Mu nearly collapsed** — pred_mean_std halved (0.004→0.002), corr(mean,actual) dropped to 0.004 (basically zero).
+3. **Early stopped at step 5,000** (1.3 epochs). Val loss never improved after step 5K despite 10 more val checks.
+4. **Massive sample overlap is the problem** — adjacent 4h windows share 714/720 bars (99.7%), inflating sample count without adding information. 476K "samples" ≈ 80K unique daily windows.
+5. **Patch embedding re-init hurt** — v5's learned daily patch weights couldn't transfer to 4h patches (different patch_len). The model had to learn 4h patterns from scratch.
+6. **The cross-sectional signal lives at daily resolution** — sub-daily OHLCV patterns don't add ranking information.
+7. **Better NLL (-1.45 vs -1.08)** — the model fits 4h-scale distributions well (smaller returns, tighter), but this doesn't translate to cross-sectional signal.
+
+### Interpretation
+
+The failure reveals that **data quantity ≠ information quantity** when samples overlap heavily. The v6 model with 80K daily samples outperforms v7 with 476K 4h samples because each daily sample is genuinely independent. The cross-sectional ranking signal is a daily-scale phenomenon driven by end-of-day patterns (closing prices, daily volume), not intraday dynamics.
+
+---
+
+## What Worked Across All Phases (updated)
+
+| Technique | Where | Impact |
+|-----------|-------|--------|
+| Real multi-asset data | v3+ | Much richer representations than synthetic SDEs |
+| 6-channel OHLCV features | v3+ | Universal across all asset types |
+| Student-t head | v2+ | Better than MoG, captures heavy tails |
+| Asset-type classifier | v3-v5 | 94%+ accuracy, forces encoder discrimination |
+| Uncertainty calibration | v3+ | Corr(pred_std, \|error\|) = 0.50 — real cross-asset knowledge |
+| Multi-horizon decoding | v4+ | Efficient batched 30-query cross-attention |
+| Relative return targets | v5+ | IC=0.09 cross-sectional signal from OHLCV |
+| **Crypto-only training** | **v6** | **IC 0.14→0.19 at 30d — removing non-crypto noise boosts signal** |
+
+## What Didn't Work (updated)
+
+| Technique | Why |
+|-----------|-----|
+| Mean MSE loss on absolute returns | Model memorizes training directions, doesn't generalize (v4a/v4b) |
+| Synthetic data mixing for regularization | Synthetic features are distinguishable from real (v4b) |
+| Higher dropout/weight decay | Doesn't fix the fundamental lack of directional signal (v4b) |
+| Longer horizons alone | SNR improves but still insufficient for absolute prediction (v4) |
+| Absolute return prediction from OHLCV | Weak-form EMH holds — no directional signal at any horizon 1-30d (v3, v4) |
+| Taker buy ratio + funding rate features | No measurable IC contribution (delta < 0.002). OHLCV already captures the signal (v6) |
+| Open interest | Binance free API only provides 30 days of history — infeasible (v6) |
+| **4h bar granularity** | **Worse IC (0.14→0.095), massive sample overlap (99.7%), signal is daily-scale (v7)** |
+
 ## Next Steps
 
-1. **v7: 4h granularity** — 6x more crypto data. The main bottleneck is now data quantity (80K train) not features.
-2. **Transaction cost analysis** — v6 Sharpe of 5.46 is pre-cost. Need realistic estimates.
-3. **Calibration recovery** — v6 coverage degraded vs v5. May need calibration-focused fine-tuning or post-hoc recalibration.
-4. **Publication** — Write up v1→v6 progression. Key story: synthetic→real→relative→crypto-focused.
+1. **Transaction cost analysis** — v6 Sharpe of 5.46 is pre-cost. Need realistic estimates.
+2. **More crypto assets** — expand beyond 60 to 100+ assets (more exchanges, smaller caps) at daily resolution
+3. **Calibration recovery** — v6 coverage degraded vs v5. Post-hoc recalibration or calibration loss term.
+4. **Publication** — Write up v1→v7 progression. Key story: synthetic→real→relative→crypto-focused. v7 failure is a useful negative result (data quantity ≠ information).
