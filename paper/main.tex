@@ -552,16 +552,9 @@ Table~\ref{tab:ablation} summarizes the progression across eight model versions,
 The key inflection point is the shift from absolute to relative returns (v4$\to$v5), which unlocks cross-sectional signal that was inaccessible in all prior versions.
 The most impactful positive finding is that widening the asset universe from 60 to 362 assets (v6$\to$v8) doubles the Sharpe ratio through diversification, without any architectural change.
 Every negative result---synthetic pretraining, derivative features, and sub-daily data---eliminates a plausible design choice.
-Figure~\ref{fig:training} shows the training dynamics across versions v5, v6, and v8, illustrating how validation loss, distributional quality, and the predicted mean spread evolve differently depending on the training data composition.
+Figure~\ref{fig:training} shows the two-stage training dynamics for the final model.
 
-\begin{figure}[h]
-\centering
-\includegraphics[width=\columnwidth]{../plots/fig5_training.png}
-\caption{Two-stage training dynamics. Stage~1 (purple): pretraining on 413 multi-asset samples. Stage~2 (teal): fine-tuning on 362 crypto assets (dashed line = init from Stage~1 checkpoint). (a)~NLL improves in both stages. (b)~Val CRPS drops substantially after crypto fine-tuning. (c)~Predicted $\mu$ spread grows in Stage~2, indicating learned conditional signal. (d)~$\nu$ stabilizes near 2 (heavy tails). (e)~Total loss with resume point marked. (f)~Gradient norm increases during adaptation.}
-\label{fig:training}
-\end{figure}
-
-\begin{table}[h]
+\begin{table}[t]
 \small
 \centering
 \caption{Ablation across model versions (OOS crypto). ``--'' = not applicable.}
@@ -584,7 +577,7 @@ v8 & \textbf{362 assets} & \textbf{0.12} & \textbf{13.0} & Sharpe doubles via br
 \end{table}
 
 % ═══════════════════════════════════════════════════════════════
-% 6. CONCLUSION
+% 6. CONCLUSION (placed before floating figures)
 % ═══════════════════════════════════════════════════════════════
 
 \section{Conclusion}
@@ -607,6 +600,13 @@ Promising directions include live deployment with execution-aware training, inco
 
 \paragraph{Reproducibility.}
 All code, model checkpoints, and processed datasets are publicly available at \url{https://github.com/ADnocap/phantom}.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../plots/fig5_training.png}
+\caption{Two-stage training dynamics. Stage~1 (purple): pretraining on 413 multi-asset samples. Stage~2 (teal): fine-tuning on 362 crypto assets (dashed line = init from Stage~1 checkpoint). (a)~NLL improves in both stages. (b)~Val CRPS drops after crypto fine-tuning. (c)~Predicted $\mu$ spread grows in Stage~2. (d)~$\nu$ stabilizes near 2. (e)~Total loss with resume point. (f)~Gradient norm increases during adaptation.}
+\label{fig:training}
+\end{figure}
 
 % ═══════════════════════════════════════════════════════════════
 % REFERENCES
