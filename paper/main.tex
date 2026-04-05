@@ -605,6 +605,9 @@ The model's signal is partially correlated with the low-volatility anomaly ($\rh
 \paragraph{Future work.}
 Promising directions include live deployment with execution-aware training, incorporation of alternative data (on-chain metrics, social sentiment), adaptive position sizing using the predicted $\sigma_{i,h}$, and extension to decentralized finance (DeFi) protocols where cross-sectional prediction over liquidity pools presents similar opportunities.
 
+\paragraph{Reproducibility.}
+All code, model checkpoints, and processed datasets are publicly available at \url{https://github.com/ADnocap/phantom}.
+
 % ═══════════════════════════════════════════════════════════════
 % REFERENCES
 % ═══════════════════════════════════════════════════════════════
@@ -724,14 +727,5 @@ $\nu$ range & $[2.01,\, 100]$ \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-\section{Full Evaluation Dashboard}
-
-\begin{figure*}[h]
-\centering
-\includegraphics[width=\textwidth]{../plots/eval_v8_clean.png}
-\caption{Full evaluation dashboard for the v8 best checkpoint (step 24,000). Top row: Rank IC distribution, IC by horizon, long-short cumulative returns. Middle row: PIT histogram, coverage calibration, predicted vs actual scatter. Bottom row: sigma and mu term structures, daily L/S returns.}
-\label{fig:full_eval}
-\end{figure*}
 
 \end{document}
