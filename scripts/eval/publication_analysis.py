@@ -1,0 +1,693 @@
+#!/usr/bin/env python
+"""
+Comprehensive publication analysis for Phantom v8.
+
+Generates all tables and figures needed for a cross-sectional crypto prediction paper:
+  1. Transaction cost analysis (Sharpe after fees, slippage, breakeven cost)
+  2. Baseline comparisons (momentum, mean-reversion, volume, random)
+  3. Decile portfolio analysis (monotonic return spread)
+  4. Turnover analysis
+  5. Robustness: subperiod stability, market regime, per-asset-tier
+  6. Publication-quality summary figures
+
+Usage:
+  python scripts/eval/publication_analysis.py --checkpoint checkpoints_v8/best.pt
+  python scripts/eval/publication_analysis.py --checkpoint checkpoints_v8/best.pt --also_latest checkpoints_v8/latest.pt
+"""
+
+import argparse
+import json
+import numpy as np
+import torch
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from scipy.stats import spearmanr, t as scipy_t
+from pathlib import Path
+
+from src.model import PhantomConfig, PhantomModel
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  UTILITIES
+# ═══════════════════════════════════════════════════════════════════
+
+def load_model(ckpt_path):
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    cfg_dict = ckpt['config']
+    cfg = PhantomConfig(**{k: v for k, v in cfg_dict.items()
+                          if k in PhantomConfig.__dataclass_fields__})
+    model = PhantomModel(cfg)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
+    return model, ckpt
+
+
+def predict(model, X, batch_size=1024):
+    all_mu, all_sigma, all_nu = [], [], []
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            log_pi, mu, sigma, nu = model(torch.from_numpy(X[i:i+batch_size]))
+            all_mu.append(mu.numpy())
+            all_sigma.append(sigma.numpy())
+            if nu is not None:
+                all_nu.append(nu.numpy())
+    return (np.concatenate(all_mu).squeeze(-1),
+            np.concatenate(all_sigma).squeeze(-1),
+            np.concatenate(all_nu).squeeze(-1) if all_nu else None)
+
+
+def rank_ic_per_date(pred, actual, dates, min_assets=10):
+    """Spearman IC for each unique date."""
+    unique = np.unique(dates)
+    ics, ic_dates = [], []
+    for d in unique:
+        m = dates == d
+        if m.sum() < min_assets:
+            continue
+        ic, _ = spearmanr(pred[m], actual[m])
+        if np.isfinite(ic):
+            ics.append(ic)
+            ic_dates.append(d)
+    return np.array(ics), np.array(ic_dates)
+
+
+def long_short_returns(pred, actual, dates, quantile=0.2, min_assets=10):
+    """Daily L/S return: long top quantile, short bottom quantile."""
+    unique = np.unique(dates)
+    rets, valid_dates = [], []
+    for d in unique:
+        m = dates == d
+        n = m.sum()
+        if n < min_assets:
+            continue
+        p, a = pred[m], actual[m]
+        k = max(1, int(n * quantile))
+        top = np.argsort(p)[-k:]
+        bot = np.argsort(p)[:k]
+        rets.append(a[top].mean() - a[bot].mean())
+        valid_dates.append(d)
+    return np.array(rets), np.array(valid_dates)
+
+
+def sharpe(returns, annual_factor=252):
+    if len(returns) == 0 or returns.std() == 0:
+        return 0.0
+    return returns.mean() / returns.std() * np.sqrt(annual_factor)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  1. TRANSACTION COST ANALYSIS
+# ═══════════════════════════════════════════════════════════════════
+
+def transaction_cost_analysis(pred, actual, dates, quantile=0.2):
+    """Analyze strategy profitability under various cost assumptions."""
+    print("\n" + "="*60)
+    print("1. TRANSACTION COST ANALYSIS")
+    print("="*60)
+
+    ls_rets, ls_dates = long_short_returns(pred, actual, dates, quantile)
+    gross_sharpe = sharpe(ls_rets)
+    gross_cum = np.cumsum(ls_rets)
+
+    # Turnover: fraction of portfolio that changes each day
+    unique = np.unique(dates)
+    turnovers = []
+    prev_top, prev_bot = None, None
+    for d in unique:
+        m = dates == d
+        if m.sum() < 10:
+            continue
+        p = pred[m]
+        n = m.sum()
+        k = max(1, int(n * quantile))
+        top = set(np.argsort(p)[-k:])
+        bot = set(np.argsort(p)[:k])
+        if prev_top is not None:
+            # One-sided turnover: fraction of positions replaced
+            top_turn = 1 - len(top & prev_top) / max(len(top), 1)
+            bot_turn = 1 - len(bot & prev_bot) / max(len(bot), 1)
+            turnovers.append((top_turn + bot_turn) / 2)
+        prev_top, prev_bot = top, bot
+
+    avg_turnover = np.mean(turnovers) if turnovers else 0
+    print(f"\n  Average daily turnover: {avg_turnover*100:.1f}%")
+    print(f"  Gross Sharpe: {gross_sharpe:.2f}")
+    print(f"  Gross cumulative: {gross_cum[-1]*100:.1f}%")
+
+    # Cost scenarios (one-way cost in bps, applied to turnover)
+    # Total daily cost = 2 * one_way_cost * turnover (buy + sell)
+    cost_scenarios = {
+        'Zero cost': 0,
+        '5 bps (VIP maker)': 5,
+        '10 bps (standard)': 10,
+        '20 bps (taker + spread)': 20,
+        '30 bps (conservative)': 30,
+        '50 bps (pessimistic)': 50,
+    }
+
+    results = {}
+    print(f"\n  {'Scenario':<30} {'Daily Cost':>12} {'Net Sharpe':>12} {'Net Cum':>12}")
+    print(f"  {'-'*30} {'-'*12} {'-'*12} {'-'*12}")
+
+    for name, cost_bps in cost_scenarios.items():
+        daily_cost = 2 * (cost_bps / 10000) * avg_turnover
+        net_rets = ls_rets - daily_cost
+        net_sh = sharpe(net_rets)
+        net_cum = np.cumsum(net_rets)[-1]
+        results[name] = {'sharpe': net_sh, 'cumulative': net_cum, 'daily_cost': daily_cost}
+        print(f"  {name:<30} {daily_cost*100:>10.3f}% {net_sh:>12.2f} {net_cum*100:>10.1f}%")
+
+    # Breakeven cost
+    if gross_sharpe > 0 and avg_turnover > 0:
+        mean_ret = ls_rets.mean()
+        breakeven_bps = (mean_ret / (2 * avg_turnover)) * 10000
+        print(f"\n  Breakeven one-way cost: {breakeven_bps:.0f} bps")
+    else:
+        breakeven_bps = 0
+
+    return {
+        'gross_sharpe': gross_sharpe,
+        'avg_turnover': avg_turnover,
+        'breakeven_bps': breakeven_bps,
+        'cost_scenarios': results,
+        'turnovers': np.array(turnovers),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  2. BASELINE COMPARISONS
+# ═══════════════════════════════════════════════════════════════════
+
+def baseline_comparisons(X, Y_rel, dates, model_pred, h_ref=9):
+    """Compare model predictions against simple baselines."""
+    print("\n" + "="*60)
+    print("2. BASELINE COMPARISONS")
+    print("="*60)
+
+    actual = Y_rel[:, h_ref]
+    N = len(X)
+
+    baselines = {}
+
+    # Model prediction
+    model_ics, _ = rank_ic_per_date(model_pred[:, h_ref], actual, dates)
+    model_ls, _ = long_short_returns(model_pred[:, h_ref], actual, dates)
+    baselines['Phantom (ours)'] = {
+        'ic': model_ics.mean(), 'ic_std': model_ics.std(),
+        'sharpe': sharpe(model_ls), 'win_rate': (model_ls > 0).mean(),
+    }
+
+    # 1. Momentum: past N-day return as signal
+    for lookback in [5, 10, 20]:
+        # Past return = sum of log returns over last `lookback` days
+        signal = X[:, -lookback:, 0].sum(axis=1)  # channel 0 = log return
+        ics, _ = rank_ic_per_date(signal, actual, dates)
+        ls, _ = long_short_returns(signal, actual, dates)
+        baselines[f'Momentum ({lookback}d)'] = {
+            'ic': ics.mean(), 'ic_std': ics.std(),
+            'sharpe': sharpe(ls), 'win_rate': (ls > 0).mean(),
+        }
+
+    # 2. Mean-reversion: negative past return
+    for lookback in [1, 5]:
+        signal = -X[:, -lookback:, 0].sum(axis=1)
+        ics, _ = rank_ic_per_date(signal, actual, dates)
+        ls, _ = long_short_returns(signal, actual, dates)
+        baselines[f'Mean-Rev ({lookback}d)'] = {
+            'ic': ics.mean(), 'ic_std': ics.std(),
+            'sharpe': sharpe(ls), 'win_rate': (ls > 0).mean(),
+        }
+
+    # 3. Volume: abnormal volume as signal (high volume = continuation?)
+    signal = X[:, -5:, 3].mean(axis=1)  # channel 3 = log volume ratio
+    ics, _ = rank_ic_per_date(signal, actual, dates)
+    ls, _ = long_short_returns(signal, actual, dates)
+    baselines['Volume (5d avg)'] = {
+        'ic': ics.mean(), 'ic_std': ics.std(),
+        'sharpe': sharpe(ls), 'win_rate': (ls > 0).mean(),
+    }
+
+    # 4. Volatility: low vol = outperform?
+    signal = -X[:, -1, 4]  # channel 4 = trailing vol (negative = low vol first)
+    ics, _ = rank_ic_per_date(signal, actual, dates)
+    ls, _ = long_short_returns(signal, actual, dates)
+    baselines['Low Vol'] = {
+        'ic': ics.mean(), 'ic_std': ics.std(),
+        'sharpe': sharpe(ls), 'win_rate': (ls > 0).mean(),
+    }
+
+    # 5. Random signal
+    rng = np.random.default_rng(42)
+    signal = rng.standard_normal(N)
+    ics, _ = rank_ic_per_date(signal, actual, dates)
+    ls, _ = long_short_returns(signal, actual, dates)
+    baselines['Random'] = {
+        'ic': ics.mean(), 'ic_std': ics.std(),
+        'sharpe': sharpe(ls), 'win_rate': (ls > 0).mean(),
+    }
+
+    print(f"\n  {'Strategy':<25} {'IC':>8} {'IC std':>8} {'Sharpe':>8} {'Win%':>8}")
+    print(f"  {'-'*25} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+    for name, m in baselines.items():
+        marker = ' ***' if name == 'Phantom (ours)' else ''
+        print(f"  {name:<25} {m['ic']:>8.4f} {m['ic_std']:>8.4f} "
+              f"{m['sharpe']:>8.2f} {m['win_rate']*100:>7.1f}%{marker}")
+
+    return baselines
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  3. DECILE PORTFOLIO ANALYSIS
+# ═══════════════════════════════════════════════════════════════════
+
+def decile_analysis(pred, actual, dates, h_ref=9, n_quantiles=10):
+    """Sort assets into deciles by prediction, compute mean return per decile."""
+    print("\n" + "="*60)
+    print("3. DECILE PORTFOLIO ANALYSIS")
+    print("="*60)
+
+    unique = np.unique(dates)
+    decile_returns = {q: [] for q in range(n_quantiles)}
+
+    for d in unique:
+        m = dates == d
+        if m.sum() < n_quantiles * 2:
+            continue
+        p = pred[m, h_ref]
+        a = actual[m, h_ref]
+        # Assign to deciles based on predicted rank
+        ranks = np.argsort(np.argsort(p))  # rank 0 = lowest predicted
+        n = len(p)
+        for q in range(n_quantiles):
+            lo = int(n * q / n_quantiles)
+            hi = int(n * (q + 1) / n_quantiles)
+            mask_q = (ranks >= lo) & (ranks < hi)
+            if mask_q.any():
+                decile_returns[q].append(a[mask_q].mean())
+
+    means = [np.mean(decile_returns[q]) for q in range(n_quantiles)]
+    stds = [np.std(decile_returns[q]) / np.sqrt(len(decile_returns[q]))
+            for q in range(n_quantiles)]
+
+    print(f"\n  {'Decile':<10} {'Mean Ret':>10} {'Std Err':>10}")
+    print(f"  {'-'*10} {'-'*10} {'-'*10}")
+    for q in range(n_quantiles):
+        label = 'Short' if q == 0 else ('Long' if q == n_quantiles-1 else f'D{q+1}')
+        print(f"  {label:<10} {means[q]*100:>9.3f}% {stds[q]*100:>9.3f}%")
+
+    spread = means[-1] - means[0]
+    print(f"\n  Long-Short spread: {spread*100:.3f}% per day")
+    print(f"  Monotonicity: {_monotonicity(means):.2f}")
+
+    return {'means': means, 'stds': stds, 'spread': spread}
+
+
+def _monotonicity(values):
+    """Spearman correlation of values with their index (1.0 = perfectly monotonic)."""
+    from scipy.stats import spearmanr
+    r, _ = spearmanr(range(len(values)), values)
+    return r
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  4. ROBUSTNESS: SUBPERIOD & REGIME ANALYSIS
+# ═══════════════════════════════════════════════════════════════════
+
+def robustness_analysis(pred, actual, dates, h_ref=9):
+    """Subperiod stability and market regime analysis."""
+    print("\n" + "="*60)
+    print("4. ROBUSTNESS ANALYSIS")
+    print("="*60)
+
+    # Monthly IC
+    months = np.array([d[:7] for d in dates])
+    unique_months = sorted(set(months))
+
+    ics_all, _ = rank_ic_per_date(pred[:, h_ref], actual[:, h_ref], dates)
+    _, ic_dates = rank_ic_per_date(pred[:, h_ref], actual[:, h_ref], dates)
+
+    monthly_ic = {}
+    for m in unique_months:
+        month_dates = ic_dates[np.array([d[:7] for d in ic_dates]) == m]
+        if len(month_dates) == 0:
+            continue
+        month_mask = np.isin(ic_dates, month_dates)
+        month_ics = ics_all[month_mask]
+        monthly_ic[m] = {'mean': month_ics.mean(), 'std': month_ics.std(), 'n': len(month_ics)}
+
+    print(f"\n  Monthly IC (h=10d):")
+    print(f"  {'Month':<10} {'IC':>8} {'Std':>8} {'Days':>6}")
+    print(f"  {'-'*10} {'-'*8} {'-'*8} {'-'*6}")
+    for m, stats in monthly_ic.items():
+        marker = ' *' if stats['mean'] < 0 else ''
+        print(f"  {m:<10} {stats['mean']:>8.4f} {stats['std']:>8.4f} {stats['n']:>6}{marker}")
+
+    pos_months = sum(1 for s in monthly_ic.values() if s['mean'] > 0)
+    print(f"\n  IC positive in {pos_months}/{len(monthly_ic)} months")
+
+    # Rolling Sharpe (60-day window)
+    ls_rets, ls_dates = long_short_returns(pred[:, h_ref], actual[:, h_ref], dates)
+    window = 60
+    rolling_sharpe = []
+    for i in range(window, len(ls_rets)):
+        w = ls_rets[i-window:i]
+        rolling_sharpe.append(sharpe(w))
+    rolling_sharpe = np.array(rolling_sharpe)
+
+    print(f"\n  Rolling 60-day Sharpe:")
+    print(f"    Mean: {rolling_sharpe.mean():.2f}")
+    print(f"    Min:  {rolling_sharpe.min():.2f}")
+    print(f"    Max:  {rolling_sharpe.max():.2f}")
+    print(f"    % > 0: {(rolling_sharpe > 0).mean()*100:.0f}%")
+
+    # Drawdown analysis
+    cum = np.cumsum(ls_rets)
+    peak = np.maximum.accumulate(cum)
+    drawdown = cum - peak
+    max_dd = drawdown.min()
+    max_dd_end = np.argmin(drawdown)
+    max_dd_start = np.argmax(cum[:max_dd_end+1])
+    dd_duration = max_dd_end - max_dd_start
+
+    print(f"\n  Drawdown analysis:")
+    print(f"    Max drawdown: {max_dd*100:.1f}%")
+    print(f"    Drawdown duration: {dd_duration} days")
+    print(f"    Recovery: {'Yes' if cum[-1] > cum[max_dd_start] else 'No'}")
+
+    return {
+        'monthly_ic': monthly_ic,
+        'rolling_sharpe': rolling_sharpe,
+        'max_drawdown': max_dd,
+        'dd_duration': dd_duration,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  5. PUBLICATION FIGURES
+# ═══════════════════════════════════════════════════════════════════
+
+def plot_publication_figures(pred, actual, dates, sigma, nu, X,
+                             cost_results, baseline_results, decile_results,
+                             robustness_results, h_ref=9, output_dir='plots'):
+    """Generate publication-quality figures."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    # ── Figure 1: Main results (4 panels) ──
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    # Panel A: IC by horizon
+    horizons = [0, 4, 9, 14, 19, 24, 29]
+    h_labels = [1, 5, 10, 15, 20, 25, 30]
+    ic_means, ic_stds = [], []
+    for h in horizons:
+        ics, _ = rank_ic_per_date(pred[:, h], actual[:, h], dates)
+        ic_means.append(ics.mean())
+        ic_stds.append(ics.std() / np.sqrt(len(ics)))
+
+    axes[0, 0].bar(range(len(h_labels)), ic_means, yerr=ic_stds, capsize=4,
+                    color='#2196F3', alpha=0.8, edgecolor='white')
+    axes[0, 0].set_xticks(range(len(h_labels)))
+    axes[0, 0].set_xticklabels([f'{h}d' for h in h_labels])
+    axes[0, 0].set_xlabel('Forecast Horizon')
+    axes[0, 0].set_ylabel('Rank IC (Spearman)')
+    axes[0, 0].set_title('(a) Cross-Sectional IC by Horizon')
+    axes[0, 0].axhline(0, color='gray', ls='--', lw=0.5)
+    axes[0, 0].grid(True, alpha=0.3, axis='y')
+
+    # Panel B: L/S cumulative with cost scenarios
+    ls_rets, _ = long_short_returns(pred[:, h_ref], actual[:, h_ref], dates)
+    cum_gross = np.cumsum(ls_rets) * 100
+    axes[0, 1].plot(cum_gross, color='#2196F3', lw=2, label='Gross')
+
+    for cost_name, cost_bps in [('10 bps', 10), ('30 bps', 30)]:
+        daily_cost = 2 * (cost_bps / 10000) * cost_results['avg_turnover']
+        cum_net = np.cumsum(ls_rets - daily_cost) * 100
+        axes[0, 1].plot(cum_net, lw=1.5, ls='--', label=f'Net ({cost_name})')
+
+    axes[0, 1].set_xlabel('Trading Days')
+    axes[0, 1].set_ylabel('Cumulative Return (%)')
+    axes[0, 1].set_title('(b) Long-Short Portfolio')
+    axes[0, 1].legend(fontsize=9)
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].axhline(0, color='gray', ls='--', lw=0.5)
+
+    # Panel C: Decile returns
+    decile_means = decile_results['means']
+    decile_stds = decile_results['stds']
+    colors = ['#f44336'] * 3 + ['#9E9E9E'] * 4 + ['#4CAF50'] * 3
+    axes[1, 0].bar(range(10), [m * 100 for m in decile_means],
+                    yerr=[s * 100 for s in decile_stds], capsize=3,
+                    color=colors, alpha=0.8, edgecolor='white')
+    axes[1, 0].set_xticks(range(10))
+    axes[1, 0].set_xticklabels([f'D{i+1}' for i in range(10)])
+    axes[1, 0].set_xlabel('Decile (D1=Short, D10=Long)')
+    axes[1, 0].set_ylabel('Mean Daily Return (%)')
+    axes[1, 0].set_title('(c) Decile Portfolio Returns')
+    axes[1, 0].axhline(0, color='gray', ls='--', lw=0.5)
+    axes[1, 0].grid(True, alpha=0.3, axis='y')
+
+    # Panel D: Baseline comparison
+    names = list(baseline_results.keys())
+    ics_baseline = [baseline_results[n]['ic'] for n in names]
+    sharpes_baseline = [baseline_results[n]['sharpe'] for n in names]
+    colors_b = ['#F7931A' if n == 'Phantom (ours)' else '#9E9E9E' for n in names]
+    y_pos = range(len(names))
+    axes[1, 1].barh(y_pos, ics_baseline, color=colors_b, alpha=0.8, edgecolor='white')
+    axes[1, 1].set_yticks(y_pos)
+    axes[1, 1].set_yticklabels(names, fontsize=8)
+    axes[1, 1].set_xlabel('Rank IC (h=10d)')
+    axes[1, 1].set_title('(d) Model vs Baselines')
+    axes[1, 1].axvline(0, color='gray', ls='--', lw=0.5)
+    axes[1, 1].grid(True, alpha=0.3, axis='x')
+
+    plt.tight_layout()
+    fig.savefig(output_dir / 'fig1_main_results.png', dpi=300, bbox_inches='tight')
+    print(f"  Saved fig1_main_results.png")
+
+    # ── Figure 2: Robustness (3 panels) ──
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+
+    # Panel A: Monthly IC
+    monthly = robustness_results['monthly_ic']
+    m_names = list(monthly.keys())
+    m_vals = [monthly[m]['mean'] for m in m_names]
+    colors_m = ['#4CAF50' if v > 0 else '#f44336' for v in m_vals]
+    axes[0].bar(range(len(m_names)), m_vals, color=colors_m, alpha=0.8)
+    axes[0].set_xticks(range(len(m_names)))
+    axes[0].set_xticklabels(m_names, rotation=45, ha='right', fontsize=8)
+    axes[0].axhline(0, color='gray', ls='--')
+    axes[0].set_ylabel('Mean Rank IC')
+    axes[0].set_title('(a) Monthly IC Stability')
+    axes[0].grid(True, alpha=0.3, axis='y')
+
+    # Panel B: Rolling Sharpe
+    rs = robustness_results['rolling_sharpe']
+    axes[1].plot(rs, color='#2196F3', lw=1.5)
+    axes[1].axhline(0, color='gray', ls='--')
+    axes[1].axhline(rs.mean(), color='red', ls='--', alpha=0.5,
+                     label=f'Mean: {rs.mean():.1f}')
+    axes[1].fill_between(range(len(rs)), 0, rs,
+                          where=rs > 0, alpha=0.2, color='green')
+    axes[1].fill_between(range(len(rs)), 0, rs,
+                          where=rs < 0, alpha=0.2, color='red')
+    axes[1].set_xlabel('Trading Day')
+    axes[1].set_ylabel('60-Day Rolling Sharpe')
+    axes[1].set_title('(b) Rolling Sharpe Ratio')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    # Panel C: Turnover
+    turnovers = cost_results['turnovers']
+    axes[2].plot(turnovers * 100, color='#FF9800', lw=1, alpha=0.5)
+    axes[2].plot(np.convolve(turnovers, np.ones(20)/20, 'valid') * 100,
+                  color='#FF9800', lw=2, label=f'Mean: {turnovers.mean()*100:.1f}%')
+    axes[2].set_xlabel('Trading Day')
+    axes[2].set_ylabel('Daily Turnover (%)')
+    axes[2].set_title('(c) Portfolio Turnover')
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fig.savefig(output_dir / 'fig2_robustness.png', dpi=300, bbox_inches='tight')
+    print(f"  Saved fig2_robustness.png")
+
+    # ── Figure 3: Distributional quality (3 panels) ──
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+
+    # PIT histogram
+    pit = scipy_t.cdf(actual[:, h_ref], df=nu[:, h_ref],
+                       loc=pred[:, h_ref], scale=sigma[:, h_ref])
+    axes[0].hist(pit, bins=30, density=True, color='#2196F3', alpha=0.7, edgecolor='white')
+    axes[0].axhline(1.0, color='red', ls='--', lw=1.5)
+    axes[0].set_xlabel('PIT Value')
+    axes[0].set_ylabel('Density')
+    axes[0].set_title('(a) PIT Histogram (h=10d)')
+    axes[0].set_xlim(0, 1)
+    axes[0].grid(True, alpha=0.3)
+
+    # Coverage calibration
+    levels = [0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99]
+    actual_cov = []
+    for level in levels:
+        alpha = (1 - level) / 2
+        lo = scipy_t.ppf(alpha, df=nu[:, h_ref], loc=pred[:, h_ref], scale=sigma[:, h_ref])
+        hi = scipy_t.ppf(1-alpha, df=nu[:, h_ref], loc=pred[:, h_ref], scale=sigma[:, h_ref])
+        actual_cov.append(((actual[:, h_ref] >= lo) & (actual[:, h_ref] <= hi)).mean())
+
+    axes[1].plot([l*100 for l in levels], [a*100 for a in actual_cov],
+                  'o-', color='#2196F3', ms=6, lw=2, label='Model')
+    axes[1].plot([40, 100], [40, 100], '--', color='gray', lw=1)
+    axes[1].set_xlabel('Nominal Coverage (%)')
+    axes[1].set_ylabel('Empirical Coverage (%)')
+    axes[1].set_title('(b) Coverage Calibration')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    # Sigma term structure
+    mean_sigma = sigma.mean(axis=0)
+    h_range = np.arange(1, len(mean_sigma) + 1)
+    axes[2].plot(h_range, mean_sigma, 'b-', lw=2, label='Model')
+    axes[2].plot(h_range, mean_sigma[0] * np.sqrt(h_range), 'r--', lw=1.5,
+                  label=r'$\sigma_1\sqrt{h}$')
+    axes[2].set_xlabel('Horizon (days)')
+    axes[2].set_ylabel('Mean Predicted Sigma')
+    axes[2].set_title('(c) Volatility Term Structure')
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fig.savefig(output_dir / 'fig3_distributional.png', dpi=300, bbox_inches='tight')
+    print(f"  Saved fig3_distributional.png")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  6. SUMMARY TABLE (LaTeX-ready)
+# ═══════════════════════════════════════════════════════════════════
+
+def print_summary_table(pred, actual, dates, sigma, nu, cost_results, h_ref=9):
+    """Print LaTeX-ready summary table."""
+    print("\n" + "="*60)
+    print("5. SUMMARY TABLE")
+    print("="*60)
+
+    ics, _ = rank_ic_per_date(pred[:, h_ref], actual[:, h_ref], dates)
+    ls_rets, _ = long_short_returns(pred[:, h_ref], actual[:, h_ref], dates)
+    tstat = ics.mean() / (ics.std() / np.sqrt(len(ics)))
+
+    pit = scipy_t.cdf(actual[:, h_ref], df=nu[:, h_ref],
+                       loc=pred[:, h_ref], scale=sigma[:, h_ref])
+    from scipy.stats import kstest
+    ks_stat, ks_p = kstest(pit, 'uniform')
+
+    print(f"""
+  \\begin{{tabular}}{{lc}}
+  \\toprule
+  Metric & Value \\\\
+  \\midrule
+  \\multicolumn{{2}}{{l}}{{\\textit{{Cross-Sectional Signal}}}} \\\\
+  Rank IC (10d) & {ics.mean():.3f} $\\pm$ {ics.std():.3f} \\\\
+  IC $t$-statistic & {tstat:.1f} \\\\
+  IC positive days & {(ics>0).mean()*100:.0f}\\% \\\\
+  \\midrule
+  \\multicolumn{{2}}{{l}}{{\\textit{{Long-Short Portfolio (h=10d)}}}} \\\\
+  Annualized Sharpe (gross) & {sharpe(ls_rets):.2f} \\\\
+  Annualized Sharpe (10 bps) & {cost_results['cost_scenarios']['10 bps (standard)']['sharpe']:.2f} \\\\
+  Annualized Sharpe (30 bps) & {cost_results['cost_scenarios']['30 bps (conservative)']['sharpe']:.2f} \\\\
+  Win rate & {(ls_rets>0).mean()*100:.1f}\\% \\\\
+  Max drawdown & {cost_results.get('max_dd', 0)*100:.1f}\\% \\\\
+  Avg daily turnover & {cost_results['avg_turnover']*100:.1f}\\% \\\\
+  \\midrule
+  \\multicolumn{{2}}{{l}}{{\\textit{{Distributional Quality}}}} \\\\
+  NLL & {-scipy_t.logpdf(actual, df=nu, loc=pred, scale=sigma).mean():.3f} \\\\
+  KS test $p$-value (PIT) & {ks_p:.3f} \\\\
+  Coverage 90\\% & {_coverage(actual[:,h_ref], pred[:,h_ref], sigma[:,h_ref], nu[:,h_ref], 0.90)*100:.1f}\\% \\\\
+  \\bottomrule
+  \\end{{tabular}}
+  """)
+
+
+def _coverage(actual, mu, sigma, nu, level):
+    alpha = (1 - level) / 2
+    lo = scipy_t.ppf(alpha, df=nu, loc=mu, scale=sigma)
+    hi = scipy_t.ppf(1 - alpha, df=nu, loc=mu, scale=sigma)
+    return ((actual >= lo) & (actual <= hi)).mean()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="Publication analysis for Phantom")
+    parser.add_argument('--checkpoint', type=str, default='checkpoints_v8/best.pt')
+    parser.add_argument('--test_data', type=str, default='data/processed_v8/test.npz')
+    parser.add_argument('--output_dir', type=str, default='plots')
+    args = parser.parse_args()
+
+    print("Loading model...")
+    model, ckpt = load_model(args.checkpoint)
+    step = ckpt.get('step', 0)
+    print(f"  Checkpoint: step {step}")
+
+    print("Loading test data...")
+    d = np.load(args.test_data, allow_pickle=True)
+    X = d['X'].astype(np.float32)
+    Y_rel = d['Y_relative'].astype(np.float32)
+    dates = d['dates_end']
+    print(f"  {len(X):,} samples, {len(np.unique(dates))} dates, "
+          f"{dates.min()} to {dates.max()}")
+
+    print("Computing predictions...")
+    mu, sigma, nu = predict(model, X)
+    h_ref = 9  # 10-day horizon
+
+    # Run all analyses
+    cost_results = transaction_cost_analysis(mu[:, h_ref], Y_rel[:, h_ref], dates)
+    baseline_results = baseline_comparisons(X, Y_rel, dates, mu, h_ref)
+    decile_results = decile_analysis(mu, Y_rel, dates, h_ref)
+    robustness_results = robustness_analysis(mu, Y_rel, dates, h_ref)
+
+    # Publication figures
+    print("\n" + "="*60)
+    print("GENERATING PUBLICATION FIGURES")
+    print("="*60)
+    plot_publication_figures(mu, Y_rel, dates, sigma, nu, X,
+                             cost_results, baseline_results,
+                             decile_results, robustness_results,
+                             h_ref, args.output_dir)
+
+    # Summary table
+    print_summary_table(mu, Y_rel, dates, sigma, nu, cost_results, h_ref)
+
+    # Save all results as JSON
+    results = {
+        'step': step,
+        'n_samples': len(X),
+        'n_dates': len(np.unique(dates)),
+        'cost_analysis': {
+            'gross_sharpe': cost_results['gross_sharpe'],
+            'avg_turnover': cost_results['avg_turnover'],
+            'breakeven_bps': cost_results['breakeven_bps'],
+            'net_sharpes': {k: v['sharpe'] for k, v in cost_results['cost_scenarios'].items()},
+        },
+        'baselines': {k: {kk: float(vv) for kk, vv in v.items()}
+                      for k, v in baseline_results.items()},
+        'decile_spread': decile_results['spread'],
+        'decile_monotonicity': float(_monotonicity(decile_results['means'])),
+    }
+    results_path = Path(args.output_dir) / 'publication_results.json'
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Saved {results_path}")
+
+    print("\n" + "="*60)
+    print("ANALYSIS COMPLETE")
+    print("="*60)
+
+
+if __name__ == '__main__':
+    main()
