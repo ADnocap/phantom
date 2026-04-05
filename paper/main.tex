@@ -3,7 +3,8 @@
 
 % Remove ACM-specific metadata for draft
 \settopmatter{printacmref=false}
-\renewcommand\footnotetextcopyrightpermission[1]{}
+\renewcommand\footnotetextcopyrightpermission[1]{%
+  \noindent\footnotesize Contact: \texttt{alexandre.dalban@student-cs.fr},\; \texttt{alexandre.dalban@gmail.com}}
 \pagestyle{plain}
 
 \usepackage{booktabs}
@@ -30,8 +31,6 @@
 %\author{Anonymous}
 %\affiliation{\institution{Anonymous Institution}}
 \author{Alexandre Dalban}
-\email{alexandre.dalban@student-cs.fr}
-\email{alexandre.dalban@gmail.com}
 \affiliation{%
   \institution{CentraleSup\'elec, Universit\'e Paris-Saclay}
   \country{France}
@@ -279,7 +278,7 @@ The full architecture is shown in Figure~\ref{fig:arch}.
 To decode distributions at all $H = 30$ horizons in a single forward pass, each horizon $h \in \{1, \ldots, H\}$ is mapped to a query $\mathbf{q}_h^{(0)} = \mathbf{E}_h$ via a learned embedding table.
 The 30 queries attend to the encoder output through $D = 2$ decoder layers, each applying pre-norm cross-attention followed by a feedforward network:
 \begin{align}
-\hat{\mathbf{q}}_h^{(\ell)} &= \mathbf{q}_h^{(\ell-1)} + \text{MultiHead}\!\Big(\underbrace{\text{LN}(\mathbf{q}_h^{(\ell-1)})}_{\text{query}},\; \underbrace{\mathbf{Z}^{(M)}}_{\text{key, value}}\Big) \label{eq:cross-attn} \\
+\hat{\mathbf{q}}_h^{(\ell)} &= \mathbf{q}_h^{(\ell-1)} + \text{MultiHead }\!\Big(\underbrace{\text{LN}(\mathbf{q}_h^{(\ell-1)})}_{\text{query}},\; \underbrace{\mathbf{Z}^{(M)}}_{\text{key, value}}\Big) \label{eq:cross-attn} \\
 \mathbf{q}_h^{(\ell)} &= \hat{\mathbf{q}}_h^{(\ell)} + \text{FFN}\!\left(\text{LN}(\hat{\mathbf{q}}_h^{(\ell)})\right) \nonumber
 \end{align}
 This produces a decoded vector $\mathbf{q}_h^{(D)} \in \mathbb{R}^d$ per horizon, with total complexity $O(H \cdot N \cdot d)$.
@@ -558,7 +557,7 @@ Figure~\ref{fig:training} shows the training dynamics across versions v5, v6, an
 \begin{figure}[h]
 \centering
 \includegraphics[width=\columnwidth]{../plots/fig5_training.png}
-\caption{Training dynamics across model versions. (a--c)~Validation loss, NLL, and CRPS over training steps for v5 (413 assets), v6 (60 crypto), and v8 (362 crypto). (d)~The predicted $\mu$ spread is highest for v8, reflecting stronger conditional signal. (e)~All versions converge to $\nu \approx 2$ (heavy tails). (f)~Out-of-sample IC comparison.}
+\caption{Two-stage training dynamics. Stage~1 (purple): pretraining on 413 multi-asset samples. Stage~2 (teal): fine-tuning on 362 crypto assets (dashed line = init from Stage~1 checkpoint). (a)~NLL improves in both stages. (b)~Val CRPS drops substantially after crypto fine-tuning. (c)~Predicted $\mu$ spread grows in Stage~2, indicating learned conditional signal. (d)~$\nu$ stabilizes near 2 (heavy tails). (e)~Total loss with resume point marked. (f)~Gradient norm increases during adaptation.}
 \label{fig:training}
 \end{figure}
 
