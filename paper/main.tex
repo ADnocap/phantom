@@ -31,10 +31,11 @@
 %\affiliation{\institution{Anonymous Institution}}
 \author{Alexandre Dalban}
 \email{alexandre.dalban@student-cs.fr}
+\email{alexandre.dalban@gmail.com}
 \affiliation{%
-  \institution{CentraleSupelec, Universit\'e Paris-Saclay}
+  \institution{CentraleSup\'elec, Universit\'e Paris-Saclay}
+  \country{France}
 }
-\authornote{Contact: alexandre.dalban@gmail.com}
 
 % ═══════════════════════════════════════════════════════════════
 % ABSTRACT (~180 words)
@@ -258,28 +259,30 @@ Critically, we apply \emph{no instance normalization} (e.g., RevIN~\cite{kim2022
 \subsection{Model Architecture}
 
 \paragraph{Patched encoder.}
-The input $\mathbf{x}_i \in \mathbb{R}^{L \times C}$ is segmented into $N$ non-overlapping patches of length~$P$:
+The input $\mathbf{x}_i \in \mathbb{R}^{L \times C}$ is divided into $N = L/P$ non-overlapping patches of length $P = 5$ time steps, giving $N = 24$ patches.
+Each patch $\mathbf{p}_n \in \mathbb{R}^{P \times C}$ is flattened and linearly projected into $\mathbb{R}^d$:
 \begin{equation}
-\mathbf{p}_n = \text{vec}\!\left(\mathbf{x}_i[nP{:}(n{+}1)P,\, :]\right) \in \mathbb{R}^{PC}, \quad n = 0, \ldots, N{-}1
+\mathbf{z}_n^{(0)} = \mathbf{W}_{\text{proj}} \cdot \text{flatten}(\mathbf{p}_n) + \mathbf{e}_n
 \end{equation}
-where $N = L/P$ (we use $P = 5$, giving $N = 24$ patches).
-Each patch is linearly projected and combined with a learned positional encoding:
-\begin{equation}
-\mathbf{z}_n^{(0)} = \mathbf{W}_{\text{proj}}\, \mathbf{p}_n + \mathbf{e}_n, \quad \mathbf{W}_{\text{proj}} \in \mathbb{R}^{d \times PC},\; \mathbf{e}_n \in \mathbb{R}^d
-\end{equation}
-with $d = 512$.
-The sequence $\mathbf{Z}^{(0)} = [\mathbf{z}_0^{(0)}, \ldots, \mathbf{z}_{N-1}^{(0)}]$ is processed by an $M$-layer pre-norm Transformer encoder ($M = 8$) with GELU activation, $d_{\text{ff}} = 2048$, and 8 attention heads, producing contextualized representations $\mathbf{Z}^{(M)} \in \mathbb{R}^{N \times d}$.
+where $\mathbf{W}_{\text{proj}} \in \mathbb{R}^{d \times PC}$ is the projection matrix and $\mathbf{e}_n \in \mathbb{R}^d$ is a learned positional encoding, with $d = 512$.
+The resulting sequence $\mathbf{Z}^{(0)} \in \mathbb{R}^{N \times d}$ is processed by an $M$-layer pre-norm Transformer encoder ($M = 8$, GELU activation, $d_{\text{ff}} = 2048$, 8 attention heads), producing contextualized patch representations $\mathbf{Z}^{(M)} \in \mathbb{R}^{N \times d}$.
+The full architecture is shown in Figure~\ref{fig:arch}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\columnwidth]{../plots/fig_architecture.png}
+\caption{Phantom architecture. The patched encoder processes 120 days of 6-channel OHLCV input into 24 contextualized patch tokens. The cross-attention decoder simultaneously queries all 30 horizons against the encoder output. Each decoded vector is mapped to Student-$t$ parameters via a two-layer MLP.}
+\label{fig:arch}
+\end{figure}
 
 \paragraph{Cross-attention decoder.}
-To predict distributions at all $H = 30$ horizons simultaneously, we use a cross-attention decoder.
-Each horizon $h \in \{1, \ldots, H\}$ is mapped to a query vector via a learned embedding table $\mathbf{E}_h \in \mathbb{R}^d$.
-All 30 queries attend to the encoder output in parallel through $D = 2$ cross-attention layers:
+To decode distributions at all $H = 30$ horizons in a single forward pass, each horizon $h \in \{1, \ldots, H\}$ is mapped to a query $\mathbf{q}_h^{(0)} = \mathbf{E}_h$ via a learned embedding table.
+The 30 queries attend to the encoder output through $D = 2$ decoder layers, each applying pre-norm cross-attention followed by a feedforward network:
 \begin{align}
-\mathbf{q}_h^{(\ell)} &= \mathbf{q}_h^{(\ell-1)} + \text{CrossAttn}\!\left(\text{LN}(\mathbf{q}_h^{(\ell-1)}),\, \mathbf{Z}^{(M)}\right) \label{eq:cross-attn} \\
-\mathbf{q}_h^{(\ell)} &= \mathbf{q}_h^{(\ell)} + \text{FFN}\!\left(\text{LN}(\mathbf{q}_h^{(\ell)})\right) \nonumber
+\hat{\mathbf{q}}_h^{(\ell)} &= \mathbf{q}_h^{(\ell-1)} + \text{MultiHead}\!\Big(\underbrace{\text{LN}(\mathbf{q}_h^{(\ell-1)})}_{\text{query}},\; \underbrace{\mathbf{Z}^{(M)}}_{\text{key, value}}\Big) \label{eq:cross-attn} \\
+\mathbf{q}_h^{(\ell)} &= \hat{\mathbf{q}}_h^{(\ell)} + \text{FFN}\!\left(\text{LN}(\hat{\mathbf{q}}_h^{(\ell)})\right) \nonumber
 \end{align}
-where $\mathbf{q}_h^{(0)} = \mathbf{E}_h$ and LN denotes LayerNorm.
-This batched decoding is computationally efficient: all 30 horizons are decoded in a single forward pass with complexity $O(H \cdot N \cdot d)$.
+This produces a decoded vector $\mathbf{q}_h^{(D)} \in \mathbb{R}^d$ per horizon, with total complexity $O(H \cdot N \cdot d)$.
 
 \paragraph{Student-$t$ output head.}
 The decoded vector $\mathbf{q}_h^{(D)} \in \mathbb{R}^d$ for each horizon is mapped to distribution parameters via a two-layer MLP:
@@ -550,6 +553,14 @@ Table~\ref{tab:ablation} summarizes the progression across eight model versions,
 The key inflection point is the shift from absolute to relative returns (v4$\to$v5), which unlocks cross-sectional signal that was inaccessible in all prior versions.
 The most impactful positive finding is that widening the asset universe from 60 to 362 assets (v6$\to$v8) doubles the Sharpe ratio through diversification, without any architectural change.
 Every negative result---synthetic pretraining, derivative features, and sub-daily data---eliminates a plausible design choice.
+Figure~\ref{fig:training} shows the training dynamics across versions v5, v6, and v8, illustrating how validation loss, distributional quality, and the predicted mean spread evolve differently depending on the training data composition.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\columnwidth]{../plots/fig5_training.png}
+\caption{Training dynamics across model versions. (a--c)~Validation loss, NLL, and CRPS over training steps for v5 (413 assets), v6 (60 crypto), and v8 (362 crypto). (d)~The predicted $\mu$ spread is highest for v8, reflecting stronger conditional signal. (e)~All versions converge to $\nu \approx 2$ (heavy tails). (f)~Out-of-sample IC comparison.}
+\label{fig:training}
+\end{figure}
 
 \begin{table}[h]
 \small
@@ -659,5 +670,69 @@ I.~Aldasoro, S.~Barth, and M.~Tsomocos.
 \newblock {\em BIS Working Paper 1087}, 2024.
 
 \end{thebibliography}
+
+\appendix
+
+\section{Model Hyperparameters}
+
+\begin{table}[h]
+\small
+\centering
+\caption{Full model configuration for v8 (final model).}
+\label{tab:hyperparams}
+\begin{tabular}{ll}
+\toprule
+Hyperparameter & Value \\
+\midrule
+\multicolumn{2}{l}{\textit{Architecture}} \\
+Context length $L$ & 120 days \\
+Input channels $C$ & 6 (OHLCV) \\
+Patch length $P$ & 5 \\
+Number of patches $N$ & 24 \\
+Model dimension $d$ & 512 \\
+FFN dimension $d_\text{ff}$ & 2048 \\
+Encoder layers $M$ & 8 \\
+Decoder layers $D$ & 2 \\
+Attention heads & 8 \\
+Forecast horizons $H$ & 30 \\
+Head hidden dimension & 256 \\
+Total parameters & 31.7M \\
+\midrule
+\multicolumn{2}{l}{\textit{Training}} \\
+Optimizer & AdamW ($\beta_1{=}0.9$, $\beta_2{=}0.95$) \\
+Peak learning rate & $3 \times 10^{-4}$ \\
+Min learning rate & $1 \times 10^{-6}$ \\
+LR schedule & Cosine annealing \\
+Warmup steps & 2,000 \\
+Weight decay & 0.05 \\
+Gradient clipping & 1.0 \\
+Batch size & 512 \\
+Dropout & 0.3 \\
+Condition dropout $p_\text{drop}$ & 0.15 \\
+AMP & bfloat16 \\
+\midrule
+\multicolumn{2}{l}{\textit{Loss weights}} \\
+$\lambda_\text{NLL}$ & 1.0 \\
+$\lambda_\text{CRPS}$ & 0.5 \\
+$\lambda_\text{MSE}$ & 0.3 \\
+$\lambda_\text{var}$ & 0.1 \\
+Min MSE horizon $h_\text{min}$ & 5 days \\
+Horizon weighting & $\sqrt{h/H}$ \\
+\midrule
+\multicolumn{2}{l}{\textit{Output head}} \\
+$\sigma$ range & $[e^{-7},\, e^2]$ \\
+$\nu$ range & $[2.01,\, 100]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Additional Figures}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\columnwidth]{../plots/eval_v8_best.png}
+\caption{Full evaluation dashboard for the v8 best checkpoint (step 24,000). Top row: Rank IC distribution (h=10d), IC by horizon, long-short cumulative. Middle row: PIT histogram, coverage calibration, CRPS by asset type. Bottom rows: conditional signal scatter, sigma/mu term structures, IC by asset class, daily L/S returns, summary statistics.}
+\label{fig:full_eval}
+\end{figure}
 
 \end{document}
