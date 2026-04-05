@@ -37,8 +37,8 @@ Cross-sectional return prediction---ranking which assets will outperform their p
 We present Phantom, a Transformer-based model that predicts full Student-$t$ distributions of cross-sectional \emph{relative} returns across 362 cryptocurrencies at horizons of 1--30 days, using only standard OHLCV price and volume features.
 The model employs a patched encoder with cross-attention decoding for simultaneous multi-horizon prediction, trained on cross-sectionally demeaned returns to isolate idiosyncratic signal from shared market factors.
 On 15 months of fully out-of-sample data (January 2025--March 2026), Phantom achieves a rank information coefficient (IC) of 0.124 at the 10-day horizon ($t = 8.93$, Newey-West), with a long-short portfolio Sharpe ratio of 11.84 net of 30 basis points transaction costs, a 74.7\% daily win rate, and perfect decile monotonicity.
-The signal is orthogonal to the well-documented low-volatility anomaly.
-Through systematic ablation across eight model versions, we establish that the cross-sectional signal resides in daily OHLCV patterns, cannot be extracted from absolute returns, does not benefit from derivative market features, and scales with the breadth of the asset universe---but not with higher-frequency data.
+Double-sorted portfolio analysis reveals that Phantom's signal is concentrated in high-volatility assets (IC$\,{=}\,$0.092, $t\,{=}\,$6.77) and is partially correlated with the low-volatility anomaly ($\rho\,{=}\,$0.63), yet combining both signals yields the highest IC of 0.157.
+Through systematic ablation across eight model versions, we establish that the cross-sectional signal resides in daily OHLCV patterns, cannot be extracted from absolute returns, does not benefit from derivative market features (funding rates, order flow), and scales with the breadth of the asset universe---but not with higher-frequency data.
 \end{abstract}
 
 \maketitle
@@ -111,9 +111,12 @@ additional features, data granularity, universe breadth.]
     breadth (Sharpe doubles from 60 to 362 assets) and survives
     transaction costs up to 336 basis points per trade.
 
-    \item We show orthogonality to the low-volatility anomaly via
-    double-sorted portfolios, establishing that Phantom captures a
-    distinct source of cross-sectional alpha.
+    \item We characterize the signal's relationship to the
+    low-volatility anomaly via double-sorted portfolios: Phantom's
+    predictive power concentrates in high-volatility assets
+    (IC$\,{=}\,$0.092, $t\,{=}\,$6.77) where low-vol sorting alone
+    provides no ranking, and combining both signals achieves the
+    highest IC of 0.157.
 \end{itemize}
 
 % ═══════════════════════════════════════════════════════════════
@@ -149,11 +152,25 @@ inverts attention. Chronos tokenized forecasting. JointFM synthetic
 SDE distributional prediction. Our architecture closest to PatchTST
 but with cross-attention decoder for multi-horizon + Student-t head.]
 
+\subsection{Distributional Foundation Models}
+[TO FILL: JointFM (Hackmann 2026) --- closest related work.
+Transformer with Variable-Factored Attention for multivariate
+distributional prediction on synthetic SDEs. Achieves oracle
+energy distance recovery. Key differences from Phantom:
+(1) JointFM predicts absolute process levels, not relative returns;
+(2) multivariate joint distributions (N=10 coupled targets) vs
+our univariate per-asset; (3) evaluated only on synthetic data,
+no real financial data or cross-sectional metrics.
+Phantom extends the JointFM paradigm to real cross-sectional
+prediction and demonstrates actual OOS signal.
+Also mention DeepAR, TFT as probabilistic forecasting baselines.]
+
 \subsection{Probabilistic Forecasting}
-[TO FILL: DeepAR, TFT, normalizing flows. Student-t vs Gaussian.
-CRPS as proper scoring rule (Gneiting \& Raftery 2007). Energy distance.
+[TO FILL: CRPS as proper scoring rule (Gneiting \& Raftery 2007).
+Student-t vs Gaussian vs mixture heads. Energy distance.
 Why parametric (Student-t) is better than quantile regression for
-financial applications.]
+financial applications --- closed-form density enables NLL training,
+tail risk quantification, and position sizing.]
 
 % ═══════════════════════════════════════════════════════════════
 % 3. METHODOLOGY (~2 pages)

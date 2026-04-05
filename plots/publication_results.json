@@ -94,6 +94,16 @@
   "quintile_spread": 0.025340169668197632,
   "quintile_monotonicity": 0.9999999999999999,
   "quintile_spread_nw_tstat": 7.442864418029785,
+  "orthogonality": {
+    "phantom_ic_within_vol": {
+      "Low Vol": -0.01222504282563058,
+      "Mid Vol": 0.05425934044574163,
+      "High Vol": 0.09199793580235983
+    },
+    "signal_correlation": 0.6276648597057559,
+    "combined_ic": 0.15691939655553586,
+    "combined_sharpe": 12.393759336161512
+  },
   "decile_spread": 0.03667359799146652,
   "decile_monotonicity": 0.9878787878787878
 }

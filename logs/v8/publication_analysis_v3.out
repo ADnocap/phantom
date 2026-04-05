@@ -1,0 +1,208 @@
+=== Publication Analysis ===
+Loading model...
+  Checkpoint: step 24000
+Loading test data...
+  144,630 samples, 430 dates, 2025-01-01 to 2026-03-06
+Computing predictions...
+
+============================================================
+1. TRANSACTION COST ANALYSIS
+============================================================
+
+  Average daily turnover: 37.8%
+  Gross Sharpe: 13.00
+  Gross cumulative: 1090.3%
+
+  Scenario                         Daily Cost   Net Sharpe      Net Cum
+  ------------------------------ ------------ ------------ ------------
+  Zero cost                           0.000%        13.00     1090.3%
+  5 bps (VIP maker)                   0.038%        12.81     1074.1%
+  10 bps (standard)                   0.076%        12.61     1057.8%
+  20 bps (taker + spread)             0.151%        12.22     1025.4%
+  30 bps (conservative)               0.227%        11.84      992.9%
+  50 bps (pessimistic)                0.378%        11.06      927.9%
+
+  Breakeven one-way cost: 336 bps
+
+============================================================
+2. BASELINE COMPARISONS
+============================================================
+
+  Strategy                        IC   IC std   Sharpe     Win%
+  ------------------------- -------- -------- -------- --------
+  Phantom (ours)              0.1240   0.1498    13.00    74.7% ***
+  Momentum (5d)              -0.0070   0.1743    -1.01    49.1%
+  Momentum (10d)             -0.0119   0.1727    -1.01    45.8%
+  Momentum (20d)             -0.0162   0.1985    -0.76    48.6%
+  Mean-Rev (1d)               0.0094   0.1800     0.81    50.0%
+  Mean-Rev (5d)               0.0070   0.1743     1.01    50.9%
+  Volume (5d avg)            -0.0459   0.0832    -8.71    33.7%
+  Low Vol                     0.1651   0.2357    12.11    73.3%
+  Random                      0.0012   0.0593     0.44    53.3%
+
+============================================================
+2b. PHANTOM vs LOW-VOL ORTHOGONALITY
+============================================================
+
+  DOUBLE SORT (Vol tercile × Phantom tercile):
+                    Low Vol      Mid Vol     High Vol
+               ------------ ------------ ------------
+         Short      1.537%     -0.396%     -2.432%
+           Mid      1.256%      0.160%     -0.868%
+          Long      1.334%      0.193%     -0.770%
+
+    L-S spread  -0.203% t=-1.0   0.589% t= 2.6   1.663% t= 4.1
+
+  Phantom IC within each vol tercile:
+       Low Vol: IC=-0.0122 (NW t=-0.99, n=430)
+       Mid Vol: IC=0.0543 (NW t=4.98, n=430)
+      High Vol: IC=0.0920 (NW t=6.77, n=430)
+
+  Signal correlation (Phantom vs Low-Vol):
+    Mean Spearman: 0.6277
+    This means the signals are correlated
+
+  Combined signal (Phantom + Low-Vol, equal weight):
+    Combined IC: 0.1569 (NW t=7.87)
+    Combined Sharpe: 12.39
+    vs Phantom alone: IC=0.0447, Sharpe=13.00
+    vs Low-Vol alone: IC=0.165, Sharpe=12.11
+
+============================================================
+3. DECILE PORTFOLIO ANALYSIS
+============================================================
+
+  Decile       Mean Ret    Std Err
+  ---------- ---------- ----------
+  Short         -2.453%     0.147%
+  D2            -0.534%     0.125%
+  D3            -0.248%     0.113%
+  D4            -0.225%     0.104%
+  D5             0.196%     0.089%
+  D6             0.170%     0.089%
+  D7             0.339%     0.084%
+  D8             0.625%     0.088%
+  D9             0.871%     0.103%
+  Long           1.215%     0.140%
+
+  Long-Short spread: 3.667% per day
+  Monotonicity: 0.99
+
+============================================================
+4. ROBUSTNESS ANALYSIS
+============================================================
+
+  Monthly IC (h=10d):
+  Month            IC      Std   Days
+  ---------- -------- -------- ------
+  2025-01      0.1799   0.1140     31
+  2025-02      0.1682   0.0783     28
+  2025-03      0.1281   0.1247     31
+  2025-04      0.0356   0.1386     30
+  2025-05      0.1059   0.2299     31
+  2025-06      0.1608   0.1883     30
+  2025-07      0.0667   0.2044     31
+  2025-08      0.1759   0.1350     31
+  2025-09      0.0450   0.1608     30
+  2025-10      0.1370   0.1412     31
+  2025-11      0.2000   0.0713     30
+  2025-12      0.1148   0.1058     31
+  2026-01      0.1720   0.0705     31
+  2026-02      0.0599   0.0776     28
+  2026-03      0.0366   0.0525      6
+
+  IC positive in 15/15 months
+
+  Rolling 60-day Sharpe:
+    Mean: 13.96
+    Min:  2.82
+    Max:  35.38
+    % > 0: 100%
+
+  Drawdown analysis:
+    Max drawdown: -38.6%
+    Drawdown duration: 14 days
+    Recovery: Yes
+
+============================================================
+GENERATING PUBLICATION FIGURES
+============================================================
+  Saved fig1_main_results.png
+  Saved fig2_robustness.png
+  Saved fig3_distributional.png
+  Saved fig4_orthogonality.png
+
+============================================================
+5. SUMMARY TABLE
+============================================================
+
+  \begin{tabular}{lc}
+  \toprule
+  Metric & Value \\
+  \midrule
+  \multicolumn{2}{l}{\textit{Cross-Sectional Signal}} \\
+  Rank IC (10d) & 0.124 $\pm$ 0.150 \\
+  IC $t$-statistic & 17.2 \\
+  IC positive days & 78\% \\
+  \midrule
+  \multicolumn{2}{l}{\textit{Long-Short Portfolio (h=10d)}} \\
+  Annualized Sharpe (gross) & 13.00 \\
+  Annualized Sharpe (10 bps) & 12.61 \\
+  Annualized Sharpe (30 bps) & 11.84 \\
+  Win rate & 74.7\% \\
+  Max drawdown & 0.0\% \\
+  Avg daily turnover & 37.8\% \\
+  \midrule
+  \multicolumn{2}{l}{\textit{Distributional Quality}} \\
+  NLL & -0.916 \\
+  KS test $p$-value (PIT) & 0.000 \\
+  Coverage 90\% & 90.3\% \\
+  \bottomrule
+  \end{tabular}
+  
+
+============================================================
+6. STRATEGY PERFORMANCE SUMMARY
+============================================================
+
+  Strategy Performance (h=10d, top/bottom 20%, equal-weighted):
+  ─────────────────────────────────────────────────────────────
+  Annualized return:           925.5%
+  Annualized volatility:        71.2%
+  Sharpe ratio:                13.00
+  Sortino ratio:               27.32
+  Calmar ratio:                23.97
+  Max drawdown:                -38.6%
+  Win rate:                     74.7%
+  Avg daily turnover:           37.8%
+  Breakeven cost (1-way):        336 bps
+
+  Rank IC (mean):             0.1240
+  Rank IC (NW t-stat):          8.93
+  L/S return (NW t-stat):       7.45
+  IC positive days:               78%
+  Months IC > 0:            15/15
+
+  Net Sharpe (10 bps):         12.61
+  Net Sharpe (30 bps):         11.84
+  Net Sharpe (50 bps):         11.06
+    
+
+============================================================
+7. QUINTILE PORTFOLIO SORT
+============================================================
+
+                       Q1        Q2        Q3        Q4        Q5     Q5-Q1
+      Mean ret    -1.491%   -0.238%    0.184%    0.482%    1.043%    2.534%
+     NW t-stat      -7.71     -1.80      1.83      4.64      5.05      7.44
+        Sharpe     -13.40     -2.78      2.57      6.94      8.95     13.02
+
+  Monotonicity (Spearman): 1.000
+  Q5-Q1 spread NW t-stat: 7.44
+
+  Saved plots/publication_results.json
+
+============================================================
+ANALYSIS COMPLETE
+============================================================
+=== Done ===
