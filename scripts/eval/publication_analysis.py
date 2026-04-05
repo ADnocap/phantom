@@ -685,7 +685,7 @@ def main():
     Y_rel = d['Y_relative'].astype(np.float32)
     dates = d['dates_end']
     print(f"  {len(X):,} samples, {len(np.unique(dates))} dates, "
-          f"{dates.min()} to {dates.max()}")
+          f"{sorted(dates)[0]} to {sorted(dates)[-1]}")
 
     print("Computing predictions...")
     mu, sigma, nu = predict(model, X)
@@ -815,7 +815,7 @@ def main():
         'n_samples': len(X),
         'n_dates': len(np.unique(dates)),
         'n_assets': len(np.unique(d['asset_id'])) if 'asset_id' in d else 362,
-        'test_period': f"{dates.min()} to {dates.max()}",
+        'test_period': f"{sorted(dates)[0]} to {sorted(dates)[-1]}",
         'performance': {
             'annualized_return_pct': ann_ret,
             'annualized_vol_pct': ann_vol,
