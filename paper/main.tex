@@ -33,7 +33,7 @@
 \author{Alexandre Dalban}
 \affiliation{%
   \institution{CentraleSup\'elec, Universit\'e Paris-Saclay}
-  \country{France}
+  \country{}
 }
 
 % ═══════════════════════════════════════════════════════════════
@@ -725,13 +725,13 @@ $\nu$ range & $[2.01,\, 100]$ \\
 \end{tabular}
 \end{table}
 
-\section{Additional Figures}
+\section{Full Evaluation Dashboard}
 
-\begin{figure}[h]
+\begin{figure*}[h]
 \centering
-\includegraphics[width=\columnwidth]{../plots/eval_v8_best.png}
-\caption{Full evaluation dashboard for the v8 best checkpoint (step 24,000). Top row: Rank IC distribution (h=10d), IC by horizon, long-short cumulative. Middle row: PIT histogram, coverage calibration, CRPS by asset type. Bottom rows: conditional signal scatter, sigma/mu term structures, IC by asset class, daily L/S returns, summary statistics.}
+\includegraphics[width=\textwidth]{../plots/eval_v8_clean.png}
+\caption{Full evaluation dashboard for the v8 best checkpoint (step 24,000). Top row: Rank IC distribution, IC by horizon, long-short cumulative returns. Middle row: PIT histogram, coverage calibration, predicted vs actual scatter. Bottom row: sigma and mu term structures, daily L/S returns.}
 \label{fig:full_eval}
-\end{figure}
+\end{figure*}
 
 \end{document}
