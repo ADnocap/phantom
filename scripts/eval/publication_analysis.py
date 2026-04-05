@@ -947,7 +947,15 @@ def main():
     # Run all analyses
     cost_results = transaction_cost_analysis(mu[:, h_ref], Y_rel[:, h_ref], dates)
     baseline_results = baseline_comparisons(X, Y_rel, dates, mu, h_ref)
-    ortho_results = orthogonality_analysis(X, Y_rel, dates, mu, h_ref)
+
+    try:
+        ortho_results = orthogonality_analysis(X, Y_rel, dates, mu, h_ref)
+    except Exception as e:
+        print(f"\n  ERROR in orthogonality_analysis: {e}")
+        import traceback; traceback.print_exc()
+        ortho_results = {'phantom_ic_within_vol': {}, 'signal_correlation': 0,
+                         'combined_ic': 0, 'combined_sharpe': 0}
+
     decile_results = decile_analysis(mu, Y_rel, dates, h_ref)
     robustness_results = robustness_analysis(mu, Y_rel, dates, h_ref)
 

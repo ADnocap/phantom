@@ -6,11 +6,16 @@
 \pagestyle{plain}
 
 \usepackage{booktabs}
-\usepackage{amsmath,amssymb}
+\usepackage{amsmath}
+\let\Bbbk\relax  % Fix conflict between amssymb and newtx
+\usepackage{amssymb}
 \usepackage{algorithm}
 \usepackage{algorithmic}
 \usepackage{subcaption}
 \usepackage{multirow}
+
+% Required ACM metadata
+\keywords{cryptocurrency, cross-sectional prediction, distributional forecasting, Transformer, Student-t}
 
 \begin{document}
 
@@ -149,7 +154,7 @@ Their work demonstrates that standard asset pricing methodology transfers to the
 Fieberg et al.~\cite{fieberg2024} extend this line of work by constructing CTREND, a composite trend factor that aggregates momentum and moving-average crossover signals across multiple lookback horizons.
 CTREND subsumes any individual momentum measure and earns significant alpha over the three-factor model, demonstrating that multi-horizon trend aggregation is more informative than any single-horizon signal.
 
-The low-volatility anomaly---whereby low-volatility assets earn higher risk-adjusted returns than high-volatility ones---is well-documented in equities~\cite{ang2006} and has been observed in cryptocurrency markets, where the retail-dominated investor base and lottery-like preferences for high-volatility tokens provide a natural explanation.
+The low-volatility anomaly (low-volatility assets earn higher risk-adjusted returns than high-volatility ones) is well-documented in equities~\cite{ang2006} and has been observed in cryptocurrency markets, where the retail-dominated investor base and lottery-like preferences for high-volatility tokens provide a natural explanation.
 Our double-sort analysis (Section~5.4) reveals substantial interaction between our model's signal and the low-volatility effect.
 
 All existing cross-sectional crypto studies produce point forecasts: they rank assets by a scalar signal and evaluate via portfolio sorts.
@@ -174,9 +179,12 @@ Phantom extends the distributional forecasting paradigm to real cross-sectional 
 \subsection{Probabilistic Forecasting}
 
 Distributional forecasting of financial returns has a long history, from GARCH-family models to deep learning approaches including DeepAR and Temporal Fusion Transformers.
-We evaluate distributional quality using the Continuous Ranked Probability Score (CRPS), a strictly proper scoring rule defined as
-$\text{CRPS}(F, y) = \mathbb{E}_F|X - y| - \tfrac{1}{2}\mathbb{E}_F|X - X'|$
-where $X, X'$ are independent draws from the predictive distribution~$F$ and $y$ is the realized value~\cite{gneiting2007}.
+We evaluate distributional quality using the Continuous Ranked Probability Score (CRPS), a strictly proper scoring rule~\cite{gneiting2007}:
+\begin{equation}
+\text{CRPS}(F, y) = \mathbb{E}_F\!\left[|X - y|\right] - \tfrac{1}{2}\,\mathbb{E}_F\!\left[|X - X'|\right]
+\label{eq:crps}
+\end{equation}
+where $X, X'$ are independent draws from the predictive distribution~$F$ and $y$ is the realized value.
 Strict propriety ensures that the score is uniquely minimized when the forecaster reports the true conditional distribution, providing a principled training and evaluation objective.
 
 We parameterize predictive distributions as Student-$t(\mu, \sigma, \nu)$ rather than Gaussian for two reasons: (i)~cryptocurrency returns exhibit substantial excess kurtosis even at multi-day horizons, and (ii)~the degrees-of-freedom parameter $\nu$ provides an adaptive, learnable measure of tail heaviness per asset and horizon.
