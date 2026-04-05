@@ -25,6 +25,9 @@ env/
 data/*
 
 
+# Large data archives
+*.tar.gz
+
 # Model artifacts
 checkpoints/
 checkpoints_ft/

@@ -29,17 +29,7 @@ apptainer exec --nv --writable-tmpfs \
   --bind $WORKDIR:$WORKDIR:rw \
   --bind $WORKDIR/mytmp:/tmp \
   $WORKDIR/unsloth.sif \
-  bash -c 'cd '"$PROJECT"' && python -c "
-import numpy as np, json
-meta = json.load(open(\"data/processed_v8/asset_meta.json\"))
-print(f\"Assets: {meta[\\\"n_assets\\\"]}\")
-for s in [\"train\", \"val\", \"test\"]:
-    d = np.load(f\"data/processed_v8/{s}.npz\", allow_pickle=True)
-    X = d[\"X\"]; Y = d[\"Y_relative\"]
-    print(f\"{s}: {len(X):,} samples, X={X.shape}\")
-    assert X.shape[1] == 120 and X.shape[2] == 6 and Y.shape[1] == 30
-print(\"Validation passed!\")
-"'
+  python $PROJECT/scripts/data/validate_v8.py
 
 if [ $? -ne 0 ]; then
     echo "ERROR: Dataset validation failed."

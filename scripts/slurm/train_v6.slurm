@@ -6,7 +6,7 @@
 #SBATCH --exclude=ruche-gpu11,ruche-gpu16,ruche-gpu17,ruche-gpu19,ruche-gpu12
 #SBATCH --cpus-per-task=16
 #SBATCH --mem-per-cpu=12G
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/v6_%j.out
 #SBATCH --error=logs/v6_%j.err
 

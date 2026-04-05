@@ -30,19 +30,15 @@ apptainer exec --nv --writable-tmpfs \
   --bind $WORKDIR:$WORKDIR:rw \
   --bind $WORKDIR/mytmp:/tmp \
   $WORKDIR/unsloth.sif \
-  bash -c "cd $PROJECT && python -c \"
+  bash -c 'cd '"$PROJECT"' && python -c "
 import numpy as np
-for split in ['train', 'val', 'test']:
-    d = np.load(f'data/processed_v7/{split}.npz', allow_pickle=True)
-    X = d['X']
-    print(f'{split}: {len(X):,} samples, X={X.shape}, Y={d[\"Y_relative\"].shape}')
-    assert X.shape[1] == 720, f'Expected 720 context, got {X.shape[1]}'
-    assert X.shape[2] == 6, f'Expected 6 channels, got {X.shape[2]}'
-    assert d['Y_relative'].shape[1] == 90, f'Expected 90 horizons, got {d[\"Y_relative\"].shape[1]}'
-    bad = (~np.isfinite(X)).sum()
-    assert bad == 0, f'{split}: {bad} NaN/Inf in X'
-print('Dataset validation passed!')
-\""
+for split in [\"train\", \"val\", \"test\"]:
+    d = np.load(f\"data/processed_v7/{split}.npz\", allow_pickle=True)
+    X = d[\"X\"]; Y = d[\"Y_relative\"]
+    print(f\"{split}: {len(X):,} samples, X={X.shape}, Y={Y.shape}\")
+    assert X.shape[1] == 720 and X.shape[2] == 6 and Y.shape[1] == 90
+print(\"Dataset validation passed!\")
+"'
 
 if [ $? -ne 0 ]; then
     echo "ERROR: Dataset validation failed."

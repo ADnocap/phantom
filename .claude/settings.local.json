@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''scripts/data/fetch_crypto_v6.py'', doraise=True\\); print\\(''fetch_crypto_v6.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''src/features.py'', doraise=True\\); print\\(''features.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''scripts/data/build_dataset_v6.py'', doraise=True\\); print\\(''build_dataset_v6.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''scripts/train/train_v6.py'', doraise=True\\); print\\(''train_v6.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''scripts/eval/eval_v6.py'', doraise=True\\); print\\(''eval_v6.py OK''\\)\")",
+      "Bash(python scripts/data/fetch_crypto_v6.py --source spot)",
+      "Bash(python scripts/data/fetch_crypto_v6.py --source spot --workers 4)",
+      "Bash(python scripts/data/fetch_crypto_v6.py --source funding --workers 4)",
+      "Bash(python scripts/data/fetch_crypto_v6.py --source oi --workers 2)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(ls data/raw/oi/*.npz)",
+      "WebFetch(domain:binance-docs.github.io)"
+    ]
+  }
+}
