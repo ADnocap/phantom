@@ -91,10 +91,56 @@ def long_short_returns(pred, actual, dates, quantile=0.2, min_assets=10):
     return np.array(rets), np.array(valid_dates)
 
 
-def sharpe(returns, annual_factor=252):
+def sharpe(returns, annual_factor=365):
+    """Annualized Sharpe. Uses 365 for crypto (24/7 trading)."""
     if len(returns) == 0 or returns.std() == 0:
         return 0.0
     return returns.mean() / returns.std() * np.sqrt(annual_factor)
+
+
+def newey_west_tstat(x, max_lag=None):
+    """Newey-West t-statistic for the mean of a time series."""
+    n = len(x)
+    if n < 5:
+        return 0.0
+    if max_lag is None:
+        max_lag = int(np.floor(4 * (n / 100) ** (2/9)))  # Andrews (1991)
+    xbar = x.mean()
+    gamma0 = np.sum((x - xbar) ** 2) / n
+    nw_var = gamma0
+    for j in range(1, max_lag + 1):
+        w = 1 - j / (max_lag + 1)  # Bartlett kernel
+        gamma_j = np.sum((x[j:] - xbar) * (x[:-j] - xbar)) / n
+        nw_var += 2 * w * gamma_j
+    se = np.sqrt(nw_var / n)
+    return xbar / se if se > 0 else 0.0
+
+
+def max_drawdown(returns):
+    """Compute max drawdown from a return series."""
+    cum = np.cumsum(returns)
+    peak = np.maximum.accumulate(cum)
+    dd = cum - peak
+    return dd.min()
+
+
+def sortino(returns, annual_factor=365):
+    """Sortino ratio (downside deviation only)."""
+    if len(returns) == 0:
+        return 0.0
+    downside = returns[returns < 0]
+    if len(downside) == 0 or downside.std() == 0:
+        return float('inf')
+    return returns.mean() / downside.std() * np.sqrt(annual_factor)
+
+
+def calmar(returns, annual_factor=365):
+    """Calmar ratio (annualized return / max drawdown)."""
+    mdd = abs(max_drawdown(returns))
+    if mdd == 0:
+        return float('inf')
+    ann_ret = returns.mean() * annual_factor
+    return ann_ret / mdd
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -663,11 +709,124 @@ def main():
     # Summary table
     print_summary_table(mu, Y_rel, dates, sigma, nu, cost_results, h_ref)
 
+    # ── Strategy performance summary table ──
+    print("\n" + "="*60)
+    print("6. STRATEGY PERFORMANCE SUMMARY")
+    print("="*60)
+    ls_rets, _ = long_short_returns(mu[:, h_ref], Y_rel[:, h_ref], dates)
+    ics, _ = rank_ic_per_date(mu[:, h_ref], Y_rel[:, h_ref], dates)
+
+    nw_t = newey_west_tstat(ls_rets)
+    ic_nw_t = newey_west_tstat(ics)
+    ann_ret = ls_rets.mean() * 365 * 100
+    ann_vol = ls_rets.std() * np.sqrt(365) * 100
+    sh = sharpe(ls_rets)
+    sort = sortino(ls_rets)
+    calm = calmar(ls_rets)
+    mdd = max_drawdown(ls_rets) * 100
+
+    print(f"""
+  Strategy Performance (h=10d, top/bottom 20%, equal-weighted):
+  ─────────────────────────────────────────────────────────────
+  Annualized return:        {ann_ret:>8.1f}%
+  Annualized volatility:    {ann_vol:>8.1f}%
+  Sharpe ratio:             {sh:>8.2f}
+  Sortino ratio:            {sort:>8.2f}
+  Calmar ratio:             {calm:>8.2f}
+  Max drawdown:             {mdd:>8.1f}%
+  Win rate:                 {(ls_rets>0).mean()*100:>8.1f}%
+  Avg daily turnover:       {cost_results['avg_turnover']*100:>8.1f}%
+  Breakeven cost (1-way):   {cost_results['breakeven_bps']:>8.0f} bps
+
+  Rank IC (mean):           {ics.mean():>8.4f}
+  Rank IC (NW t-stat):      {ic_nw_t:>8.2f}
+  L/S return (NW t-stat):   {nw_t:>8.2f}
+  IC positive days:         {(ics>0).mean()*100:>8.0f}%
+  Months IC > 0:            {sum(1 for v in robustness_results['monthly_ic'].values() if v['mean']>0)}/{len(robustness_results['monthly_ic'])}
+
+  Net Sharpe (10 bps):      {cost_results['cost_scenarios']['10 bps (standard)']['sharpe']:>8.2f}
+  Net Sharpe (30 bps):      {cost_results['cost_scenarios']['30 bps (conservative)']['sharpe']:>8.2f}
+  Net Sharpe (50 bps):      {cost_results['cost_scenarios']['50 bps (pessimistic)']['sharpe']:>8.2f}
+    """)
+
+    # ── Quintile sort table (publication format) ──
+    print("\n" + "="*60)
+    print("7. QUINTILE PORTFOLIO SORT")
+    print("="*60)
+
+    unique_dates = np.unique(dates)
+    n_q = 5
+    quintile_daily = {q: [] for q in range(n_q)}
+
+    for d in unique_dates:
+        m = dates == d
+        if m.sum() < n_q * 3:
+            continue
+        p = mu[m, h_ref]
+        a = Y_rel[m, h_ref]
+        ranks = np.argsort(np.argsort(p))
+        n = len(p)
+        for q in range(n_q):
+            lo = int(n * q / n_q)
+            hi = int(n * (q + 1) / n_q)
+            mask_q = (ranks >= lo) & (ranks < hi)
+            if mask_q.any():
+                quintile_daily[q].append(a[mask_q].mean())
+
+    print(f"\n  {'':>12} ", end='')
+    for q in range(n_q):
+        label = f'Q{q+1}'
+        print(f"{label:>10}", end='')
+    print(f"{'Q5-Q1':>10}")
+
+    # Mean return
+    q_means = [np.mean(quintile_daily[q]) for q in range(n_q)]
+    q_spread = q_means[-1] - q_means[0]
+    print(f"  {'Mean ret':>12} ", end='')
+    for q in range(n_q):
+        print(f"{q_means[q]*100:>9.3f}%", end='')
+    print(f"{q_spread*100:>9.3f}%")
+
+    # NW t-stat
+    spread_series = np.array(quintile_daily[n_q-1]) - np.array(quintile_daily[0])
+    spread_nw_t = newey_west_tstat(spread_series)
+    print(f"  {'NW t-stat':>12} ", end='')
+    for q in range(n_q):
+        t = newey_west_tstat(np.array(quintile_daily[q]))
+        print(f"{t:>10.2f}", end='')
+    print(f"{spread_nw_t:>10.2f}")
+
+    # Sharpe
+    print(f"  {'Sharpe':>12} ", end='')
+    for q in range(n_q):
+        sh_q = sharpe(np.array(quintile_daily[q]))
+        print(f"{sh_q:>10.2f}", end='')
+    sh_spread = sharpe(spread_series)
+    print(f"{sh_spread:>10.2f}")
+
+    # Monotonicity
+    mono = _monotonicity(q_means)
+    print(f"\n  Monotonicity (Spearman): {mono:.3f}")
+    print(f"  Q5-Q1 spread NW t-stat: {spread_nw_t:.2f}")
+
     # Save all results as JSON
     results = {
         'step': step,
         'n_samples': len(X),
         'n_dates': len(np.unique(dates)),
+        'n_assets': len(np.unique(d['asset_id'])) if 'asset_id' in d else 362,
+        'test_period': f"{dates.min()} to {dates.max()}",
+        'performance': {
+            'annualized_return_pct': ann_ret,
+            'annualized_vol_pct': ann_vol,
+            'sharpe_gross': sh,
+            'sortino': sort,
+            'calmar': calm,
+            'max_drawdown_pct': mdd,
+            'win_rate': (ls_rets>0).mean(),
+            'ic_mean': ics.mean(),
+            'ic_nw_tstat': ic_nw_t,
+        },
         'cost_analysis': {
             'gross_sharpe': cost_results['gross_sharpe'],
             'avg_turnover': cost_results['avg_turnover'],
@@ -676,12 +835,16 @@ def main():
         },
         'baselines': {k: {kk: float(vv) for kk, vv in v.items()}
                       for k, v in baseline_results.items()},
+        'quintile_means': [float(m) for m in q_means],
+        'quintile_spread': float(q_spread),
+        'quintile_monotonicity': float(mono),
+        'quintile_spread_nw_tstat': float(spread_nw_t),
         'decile_spread': decile_results['spread'],
         'decile_monotonicity': float(_monotonicity(decile_results['means'])),
     }
     results_path = Path(args.output_dir) / 'publication_results.json'
     with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, indent=2, default=float)
     print(f"\n  Saved {results_path}")
 
     print("\n" + "="*60)
