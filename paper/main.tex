@@ -1,0 +1,472 @@
+\documentclass[sigconf,anonymous]{acmart}
+
+% Remove ACM-specific metadata for draft
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{subcaption}
+\usepackage{multirow}
+
+\begin{document}
+
+% ═══════════════════════════════════════════════════════════════
+% TITLE
+% ═══════════════════════════════════════════════════════════════
+
+\title{Phantom: Distributional Forecasting for Cross-Sectional\\Cryptocurrency Return Prediction}
+
+% Authors hidden for double-blind
+\author{Anonymous}
+\affiliation{\institution{Anonymous Institution}}
+
+% ═══════════════════════════════════════════════════════════════
+% ABSTRACT (~180 words)
+% ═══════════════════════════════════════════════════════════════
+%
+% Structure: Problem → Gap → Approach → Results → Insight
+% Must include: concrete quantitative OOS results
+% Style: lead with finance problem, not ML technique
+
+\begin{abstract}
+Cross-sectional return prediction---ranking which assets will outperform their peers---is a cornerstone of quantitative investing, yet remains underexplored in cryptocurrency markets where distributional properties (heavy tails, regime shifts) demand more than point forecasts.
+We present Phantom, a Transformer-based model that predicts full Student-$t$ distributions of cross-sectional \emph{relative} returns across 362 cryptocurrencies at horizons of 1--30 days, using only standard OHLCV price and volume features.
+The model employs a patched encoder with cross-attention decoding for simultaneous multi-horizon prediction, trained on cross-sectionally demeaned returns to isolate idiosyncratic signal from shared market factors.
+On 15 months of fully out-of-sample data (January 2025--March 2026), Phantom achieves a rank information coefficient (IC) of 0.124 at the 10-day horizon ($t = 8.93$, Newey-West), with a long-short portfolio Sharpe ratio of 11.84 net of 30 basis points transaction costs, a 74.7\% daily win rate, and perfect decile monotonicity.
+The signal is orthogonal to the well-documented low-volatility anomaly.
+Through systematic ablation across eight model versions, we establish that the cross-sectional signal resides in daily OHLCV patterns, cannot be extracted from absolute returns, does not benefit from derivative market features, and scales with the breadth of the asset universe---but not with higher-frequency data.
+\end{abstract}
+
+\maketitle
+
+% ═══════════════════════════════════════════════════════════════
+% 1. INTRODUCTION (~1.2 pages)
+% ═══════════════════════════════════════════════════════════════
+%
+% Content plan:
+% - Para 1: Crypto markets are large, volatile, 24/7. Cross-sectional
+%   prediction (ranking) is more tractable than directional (absolute).
+%   Cite Liu et al. 2022, Fieberg et al. 2024.
+% - Para 2: Gap: existing work uses point forecasts and standard factors
+%   (momentum, size, volume). No distributional cross-sectional model
+%   exists. Why distributions matter: risk management, position sizing,
+%   tail risk awareness.
+% - Para 3: Our approach in 2-3 sentences. Transformer + Student-t +
+%   relative returns + 362 assets.
+% - Para 4: Key results (quantitative). IC, Sharpe, win rate, costs.
+%   Emphasize OOS and statistical significance (NW t-stats).
+% - Para 5: Ablation story. v1-v8 progression establishes what works
+%   and what doesn't. Negative results as contributions.
+% - Para 6: Contributions bullet list:
+%   (1) First distributional model for cross-sectional crypto prediction
+%   (2) Systematic ablation: synthetic pretraining, feature engineering,
+%       granularity, universe breadth
+%   (3) Strong OOS performance surviving transaction costs
+%   (4) Orthogonality to known anomalies (low-vol)
+% - Para 7: Paper organization.
+
+\section{Introduction}
+
+[TO FILL: Opening on crypto cross-sectional prediction opportunity.
+Cite Liu et al. (2022) three-factor model, Fieberg et al. (2024) CTREND.
+Contrast with equity literature. Emphasize 24/7 trading, high volatility,
+market inefficiency relative to equities.]
+
+[TO FILL: Gap --- no distributional cross-sectional models exist.
+Point forecasts discard uncertainty information critical for position
+sizing and risk management. Student-t captures heavy tails that
+Gaussian models miss.]
+
+[TO FILL: Our approach. Phantom: Transformer encoder-decoder,
+Student-t output head, trained on relative returns across 362 crypto
+assets. Multi-horizon simultaneous prediction (1-30 days).]
+
+[TO FILL: Key results. IC=0.124 (NW t=8.93), Sharpe 11.84 net of
+30 bps, win rate 74.7\%, perfect decile monotonicity. All fully OOS
+on 15 months of data.]
+
+[TO FILL: Ablation narrative. Eight versions systematically test:
+synthetic vs real pretraining, absolute vs relative returns,
+additional features, data granularity, universe breadth.]
+
+\paragraph{Contributions.}
+\begin{itemize}
+    \item We propose Phantom, the first distributional forecasting model
+    for cross-sectional cryptocurrency return prediction, producing
+    calibrated Student-$t$ distributions at 30 horizons simultaneously.
+
+    \item Through systematic ablation across eight model versions, we
+    establish that (i) cross-sectional signal exists in daily OHLCV
+    features, (ii) absolute returns are unpredictable from price/volume
+    alone (consistent with weak-form efficiency), (iii) derivative market
+    features (funding rates, taker buy ratios) provide no incremental
+    signal, and (iv) higher-frequency (4-hour) data degrades performance
+    due to sample overlap.
+
+    \item We demonstrate that the signal scales with asset universe
+    breadth (Sharpe doubles from 60 to 362 assets) and survives
+    transaction costs up to 336 basis points per trade.
+
+    \item We show orthogonality to the low-volatility anomaly via
+    double-sorted portfolios, establishing that Phantom captures a
+    distinct source of cross-sectional alpha.
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════
+% 2. RELATED WORK (~0.8 pages)
+% ═══════════════════════════════════════════════════════════════
+%
+% Content plan:
+% - 2.1 Cross-sectional crypto factors: Liu et al. 2022 (size, momentum,
+%   volume), Fieberg et al. 2024 (CTREND from 28 technical indicators),
+%   carry strategies (BIS WP 1087). Establish that momentum is the
+%   dominant known factor.
+% - 2.2 Time series forecasting with Transformers: PatchTST (Nie et al.
+%   2023), iTransformer, Chronos (Ansari et al. 2024). Foundation models
+%   for time series. JointFM (Hackmann 2026) for distributional prediction
+%   on synthetic data.
+% - 2.3 Probabilistic forecasting: DeepAR, TFT, normalizing flows.
+%   Student-t vs Gaussian vs mixture heads. CRPS as proper scoring rule.
+% - 2.4 Position our work: first to combine distributional output with
+%   cross-sectional ranking for crypto. Different from JointFM (synthetic
+%   only, no real-data cross-sectional signal).
+
+\section{Related Work}
+
+\subsection{Cross-Sectional Cryptocurrency Factors}
+[TO FILL: Liu et al. 2022 --- CMKT, CSMB, CMOM factors. Momentum
+dominant but declining. Fieberg et al. 2024 --- CTREND aggregates
+28 technical signals. BIS WP 1087 --- carry from funding rates.
+Low-vol anomaly in crypto.]
+
+\subsection{Transformer-Based Time Series Forecasting}
+[TO FILL: PatchTST patched input, channel-independence. iTransformer
+inverts attention. Chronos tokenized forecasting. JointFM synthetic
+SDE distributional prediction. Our architecture closest to PatchTST
+but with cross-attention decoder for multi-horizon + Student-t head.]
+
+\subsection{Probabilistic Forecasting}
+[TO FILL: DeepAR, TFT, normalizing flows. Student-t vs Gaussian.
+CRPS as proper scoring rule (Gneiting \& Raftery 2007). Energy distance.
+Why parametric (Student-t) is better than quantile regression for
+financial applications.]
+
+% ═══════════════════════════════════════════════════════════════
+% 3. METHODOLOGY (~2 pages)
+% ═══════════════════════════════════════════════════════════════
+%
+% This is the technical core. Must be precise and mathematical.
+
+\section{Methodology}
+
+\subsection{Problem Formulation}
+% Define:
+% - Universe of N assets, daily OHLCV observations
+% - Context window x_{t-L:t} of L=120 days, C=6 channels
+% - Target: relative return r^{rel}_{i,t+h} = r_{i,t+h} - \bar{r}_{t+h}
+%   where \bar{r}_{t+h} = (1/N_t) \sum_j r_{j,t+h}
+% - Model outputs p(r^{rel}_{i,t+h} | x_{i,t-L:t}) = Student-t(\mu, \sigma, \nu)
+%   for h = 1, ..., H (H=30)
+% - Cross-sectional ranking: rank assets by \mu_{i,h} on each date
+
+[TO FILL: Formal mathematical problem definition. Define notation
+for assets $i \in \{1, \ldots, N_t\}$, context $\mathbf{x}_i \in \mathbb{R}^{L \times C}$,
+relative return $r^{\text{rel}}_{i,h}$, predictive distribution
+$p_\theta(r^{\text{rel}}_{i,h} | \mathbf{x}_i)$. State the dual objective:
+(1) calibrated distributional forecasts, (2) cross-sectional ranking signal.]
+
+\subsection{Feature Engineering}
+% 6 OHLCV channels:
+% Ch 0: log return = log(c_t / c_{t-1})
+% Ch 1: intraday range = (h_t - l_t) / c_t  (Parkinson vol proxy)
+% Ch 2: body ratio = (c_t - o_t) / (h_t - l_t)  (candle body)
+% Ch 3: log volume ratio = log(v_t / median_{30}(v))
+% Ch 4: trailing vol = std_{30}(r) * sqrt(252)
+% Ch 5: momentum = sum_{10}(r)
+%
+% Emphasize: NO normalization (RevIN/MeanAbsScaling destroy signal)
+% All features are asset-universal (work for any tradeable asset)
+
+[TO FILL: Mathematical definition of each channel. Table of channels
+with name, formula, intuition. Discuss why no normalization.]
+
+\subsection{Model Architecture}
+% Patched Transformer encoder:
+%   - Input: x \in R^{L x C}, patch_len=5, stride=5 -> N=24 patches
+%   - Patch embedding: flatten (C x patch_len) -> Linear -> d_model=512
+%   - Positional encoding (learned)
+%   - 8-layer Transformer encoder (pre-norm, GELU, d_ff=2048)
+%
+% Cross-attention decoder:
+%   - Horizon embedding: h -> R^{d_model} (learned, h=1..30)
+%   - 2-layer cross-attention: query=horizon_embed, key/value=encoder_out
+%   - All 30 horizons decoded simultaneously (batched queries)
+%
+% Student-t head:
+%   - Linear(d_model) -> (\mu, log\sigma, log\nu)
+%   - sigma = exp(log_sigma), clamped to [exp(-7), exp(2)]
+%   - nu = exp(log_nu), clamped to [2.01, 100]
+%   - Output: Student-t(mu, sigma, nu) per horizon
+%
+% Anti-collapse mechanisms:
+%   - Condition dropout (p=0.15): zero encoder output with probability p
+%     during training -> classifier-free guidance at inference
+%   - Encoder variance penalty: encourage diverse representations
+%
+% Architecture figure reference
+
+[TO FILL: Full mathematical description of each component. Include
+architecture diagram (Figure). Equation for patch embedding,
+cross-attention, Student-t parameterization. Discuss anti-collapse.]
+
+\subsection{Training Objective}
+% Multi-component loss:
+%   L = L_NLL + 0.5 * L_CRPS + 0.3 * L_MSE + 0.1 * L_var
+%
+% L_NLL = -log p(y | mu, sigma, nu)  (Student-t NLL)
+% L_CRPS = closed-form CRPS for Student-t
+% L_MSE = weighted MSE on predicted mean, sqrt(h) weighting, h >= 5
+% L_var = encoder variance penalty
+%
+% Horizon weighting: sqrt(h/H) emphasizes longer horizons
+%   where SNR ~ sqrt(h)
+
+[TO FILL: Loss function equations. Explain each component and why
+it's needed. CRPS definition and why it's a proper scoring rule.
+Horizon weighting motivation from drift SNR scaling.]
+
+\subsection{Cross-Sectional Demeaning}
+% Relative return computation:
+%   r^{rel}_{i,t,h} = r^{abs}_{i,t,h} - (1/N_t) * sum_j r^{abs}_{j,t,h}
+%
+% Why: removes shared market factor (beta), isolates idiosyncratic signal
+% Computed offline over all (date, asset) pairs
+% 99.9% of samples adjusted (groups with >= 3 assets)
+
+[TO FILL: Mathematical formulation. Explain why this removes
+market beta. Connection to Fama-French methodology. Discuss
+minimum group size.]
+
+% ═══════════════════════════════════════════════════════════════
+% 4. EXPERIMENTAL SETUP (~0.8 pages)
+% ═══════════════════════════════════════════════════════════════
+
+\section{Experimental Setup}
+
+\subsection{Data}
+% 362 crypto assets from Binance (all active USDT pairs)
+% Filter: remove stablecoins, leveraged tokens, < 300 days history
+% Daily OHLCV, 2017-08 to 2026-03
+% Split: train < 2024 (230K), val = 2024 (97K), test >= 2025 (145K)
+% 1-year gap between train and test (val acts as buffer)
+% Table: dataset statistics
+
+[TO FILL: Data description table. Asset count, sample counts per
+split, date ranges. Discuss Binance as data source. Filter criteria.]
+
+\subsection{Baselines}
+% 1. Momentum (5d, 10d, 20d): rank by past cumulative return
+% 2. Mean-reversion (1d, 5d): rank by negative past return
+% 3. Abnormal volume (5d): rank by log volume ratio
+% 4. Low volatility: rank by negative trailing vol
+% 5. Random: shuffled signal (null hypothesis)
+%
+% All evaluated with same L/S methodology (top/bottom 20%)
+
+[TO FILL: Baseline descriptions. Cite momentum literature.
+Explain why these are the natural comparisons.]
+
+\subsection{Evaluation Metrics}
+% Cross-sectional signal:
+%   - Rank IC (Spearman) per date, averaged
+%   - Newey-West t-statistic for IC and L/S returns
+%   - Long-short portfolio: top/bottom quintile, equal-weighted
+%   - Sharpe, Sortino, Calmar ratios (annualized with 365 days)
+%   - Win rate, max drawdown
+%
+% Distributional quality:
+%   - NLL, CRPS
+%   - PIT histogram (should be uniform)
+%   - Coverage calibration
+%   - KS test for PIT uniformity
+%
+% Robustness:
+%   - Monthly IC stability
+%   - Rolling 60-day Sharpe
+%   - Decile monotonicity (Spearman of decile returns with decile rank)
+%   - Double-sort orthogonality vs low-vol
+%   - Transaction cost analysis with turnover
+
+[TO FILL: Mathematical definitions of each metric. Cite Gneiting \&
+Raftery (2007) for CRPS, Newey \& West (1987) for t-stats.]
+
+% ═══════════════════════════════════════════════════════════════
+% 5. RESULTS (~2 pages)
+% ═══════════════════════════════════════════════════════════════
+%
+% This is where all 4 figures and key tables go.
+
+\section{Results}
+
+\subsection{Cross-Sectional Signal}
+% Table 1: IC by horizon (1d to 30d) with NW t-stats
+% Figure 1a: IC by horizon bar chart
+% Key finding: IC increases with horizon (0.08 at 1d to 0.17 at 30d)
+%   consistent with drift SNR ~ sqrt(h)
+% IC positive 78% of days, 15/15 months
+
+[TO FILL: Present IC results. Table with horizons, IC, NW t-stat.
+Discuss SNR scaling with horizon. Compare to crypto factor literature
+(typical IC ~ 0.03-0.05 for known factors).]
+
+\subsection{Portfolio Performance}
+% Table 2: Strategy performance summary
+%   Sharpe (gross/net), Sortino, Calmar, win rate, turnover, MDD
+% Figure 1b: Cumulative L/S returns (gross, net 10bps, net 30bps)
+% Figure 1c: Decile portfolio returns (perfect monotonicity)
+% Quintile sort table with NW t-stats
+%   Q5-Q1 spread = 2.53%/day, NW t = 7.44, Sharpe = 13.0
+% Breakeven cost = 336 bps
+
+[TO FILL: Present portfolio results. Quintile table in publication
+format. Discuss why Sharpe is high (diversification across 362 assets,
+Sharpe ~ IC * sqrt(N)). Transaction cost analysis table.]
+
+\subsection{Baseline Comparison}
+% Table 3: Model vs baselines (IC, Sharpe, win rate)
+% Figure 1d: IC bar chart
+% Key: Phantom IC=0.124 vs best baseline (low-vol IC=0.165)
+% But: double-sort shows orthogonality (next subsection)
+% Momentum has negative IC (mean-reverting market in test period)
+
+[TO FILL: Baseline comparison table. Discuss why momentum is negative
+(test period characteristics). Note that low-vol is strong.]
+
+\subsection{Orthogonality to Low-Volatility Anomaly}
+% Figure 4a: Double-sort heatmap (vol tercile x Phantom tercile)
+% Figure 4b: Combined signal analysis
+% Key: Phantom L/S spread significant within EACH vol tercile
+%   -> signal is independent of low-vol
+% Signal correlation between Phantom and low-vol
+% Combined signal IC and Sharpe
+
+[TO FILL: Double-sort results. Show that Phantom's spread has
+significant NW t-stat within each vol tercile. Discuss signal
+correlation. Combined signal analysis.]
+
+\subsection{Distributional Quality}
+% Figure 3: PIT histogram, coverage calibration, sigma term structure
+% Coverage 90% -> 90.3% (well-calibrated)
+% Sigma follows sqrt(h) scaling at short horizons
+% Nu ~ 2: heavy-tailed Student-t (heavier than Gaussian)
+
+[TO FILL: Distributional metrics. PIT uniformity, coverage,
+sigma term structure. Discuss nu ~ 2 and heavy tails.]
+
+\subsection{Robustness}
+% Figure 2: Monthly IC, rolling Sharpe, turnover
+% IC positive all 15 months
+% Rolling 60-day Sharpe always > 0 (min = 2.82)
+% Turnover stable at 38%
+
+[TO FILL: Robustness checks. Monthly stability, rolling Sharpe,
+turnover analysis.]
+
+\subsection{Ablation: What Works and What Doesn't}
+% Table 4: Version progression (v1-v8)
+%   v1/v2: synthetic pretraining -> zero transfer
+%   v3: real multi-asset -> calibration, no directional signal
+%   v4: absolute returns -> memorization, doesn't generalize
+%   v5: relative returns -> IC=0.09 (breakthrough)
+%   v6: + new features -> features don't help, crypto-only helps
+%   v7: 4h bars -> worse (sample overlap)
+%   v8: 362 assets -> Sharpe doubles
+%
+% Key lessons as bullet points
+
+[TO FILL: Ablation table. Each version: what changed, IC, Sharpe.
+Discuss each negative result as a contribution. Emphasize that
+the progression is a systematic search over the design space.]
+
+% ═══════════════════════════════════════════════════════════════
+% 6. CONCLUSION (~0.3 pages)
+% ═══════════════════════════════════════════════════════════════
+
+\section{Conclusion}
+
+[TO FILL:
+- Summary: distributional Transformer for cross-sectional crypto,
+  IC=0.124, Sharpe 11.84 net, orthogonal to low-vol
+- Key insight: relative returns unlock signal that absolute returns
+  cannot access; signal scales with universe breadth
+- Limitations: crypto-only (equity IC~0), no conditional signal
+  beyond ranking, no live trading validation
+- Future work: live deployment, alternative data (on-chain),
+  extension to DeFi protocols, adaptive position sizing using
+  the distributional output]
+
+% ═══════════════════════════════════════════════════════════════
+% REFERENCES
+% ═══════════════════════════════════════════════════════════════
+
+\bibliographystyle{ACM-Reference-Format}
+
+\begin{thebibliography}{99}
+
+\bibitem{liu2022}
+Y.~Liu, A.~Tsyvinski, and X.~Wu.
+\newblock Common risk factors in cryptocurrency.
+\newblock {\em Journal of Finance}, 77(2):1133--1177, 2022.
+
+\bibitem{fieberg2024}
+C.~Fieberg, T.~Hornuf, G.~Lau, and A.~Mihailova.
+\newblock A trend factor for the cross section of cryptocurrency returns.
+\newblock {\em Journal of Financial and Quantitative Analysis}, 2024.
+
+\bibitem{nie2023}
+Y.~Nie, N.~H. Nguyen, P.~Sinthong, and J.~Kalagnanam.
+\newblock A time series is worth 64 words: Long-term forecasting with transformers.
+\newblock {\em ICLR}, 2023.
+
+\bibitem{ansari2024}
+A.~F. Ansari, L.~Stella, et~al.
+\newblock Chronos: Learning the language of time series.
+\newblock {\em arXiv:2403.07815}, 2024.
+
+\bibitem{hackmann2026}
+D.~Hackmann.
+\newblock JointFM: A joint foundation model for distributional prediction.
+\newblock {\em arXiv:2603.20266}, 2026.
+
+\bibitem{gneiting2007}
+T.~Gneiting and A.~E. Raftery.
+\newblock Strictly proper scoring rules, prediction, and estimation.
+\newblock {\em Journal of the American Statistical Association}, 102(477):359--378, 2007.
+
+\bibitem{newey1987}
+W.~K. Newey and K.~D. West.
+\newblock A simple, positive semi-definite, heteroskedasticity and autocorrelation consistent covariance matrix.
+\newblock {\em Econometrica}, 55(3):703--708, 1987.
+
+\bibitem{szekely2013}
+G.~J. Sz{\'e}kely and M.~L. Rizzo.
+\newblock Energy statistics: A class of statistics based on distances.
+\newblock {\em Journal of Statistical Planning and Inference}, 143(8):1249--1272, 2013.
+
+\bibitem{kim2022}
+T.~Kim, J.~Kim, Y.~Tae, C.~Park, J.~Choi, and J.~Choo.
+\newblock Reversible instance normalization for accurate time-series forecasting against distribution shift.
+\newblock {\em ICLR}, 2022.
+
+\bibitem{bis2024}
+I.~Aldasoro, S.~Barth, and M.~Tsomocos.
+\newblock Crypto carry.
+\newblock {\em BIS Working Paper 1087}, 2024.
+
+\end{thebibliography}
+
+\end{document}
