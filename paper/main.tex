@@ -95,9 +95,7 @@ On 15 months of fully out-of-sample data (January 2025 to March 2026, 430 tradin
 A long-short portfolio that buys the top quintile and shorts the bottom quintile earns a Sharpe ratio of 11.84 after 30 basis points of transaction costs per trade, with a 74.7\% daily win rate, perfect decile return monotonicity (Spearman $\rho = 1.0$), and IC positive in all 15 out-of-sample months.
 The strategy's breakeven transaction cost is 336 basis points, providing substantial headroom above typical exchange fees.
 
-These results emerge from a systematic search over the design space, spanning eight model versions.
-We show that (i)~synthetic pretraining on stochastic differential equations achieves oracle distributional accuracy but transfers zero signal to real data; (ii)~absolute returns are unpredictable from OHLCV features at any horizon, consistent with weak-form market efficiency; (iii)~\emph{relative} returns unlock cross-sectional signal concentrated in the cryptocurrency market; (iv)~derivative market features (funding rates, taker buy volume) provide no incremental IC; (v)~higher-frequency (4-hour) data degrades performance due to massive sample overlap; and (vi)~widening the asset universe from 60 to 362 cryptocurrencies doubles the Sharpe ratio.
-Each negative result eliminates a plausible design choice and contributes to the understanding of where cross-sectional signal resides in cryptocurrency markets.
+These results emerge from a systematic search over the design space, spanning eight model versions that progressively identify where cross-sectional signal resides---and where it does not.
 
 \paragraph{Contributions.}
 \begin{itemize}
@@ -106,12 +104,15 @@ Each negative result eliminates a plausible design choice and contributes to the
     calibrated Student-$t$ distributions at 30 horizons simultaneously.
 
     \item Through systematic ablation across eight model versions, we
-    establish that (i) cross-sectional signal exists in daily OHLCV
-    features, (ii) absolute returns are unpredictable from price/volume
-    alone (consistent with weak-form efficiency), (iii) derivative market
-    features (funding rates, taker buy ratios) provide no incremental
-    signal, and (iv) higher-frequency (4-hour) data degrades performance
-    due to sample overlap.
+    establish that (i)~cross-sectional signal exists in daily OHLCV
+    features but only in \emph{relative} (not absolute) returns,
+    consistent with weak-form market efficiency;
+    (ii)~synthetic SDE pretraining achieves oracle accuracy on synthetic
+    data but transfers zero signal to real assets;
+    (iii)~derivative market features (funding rates, taker buy ratios)
+    provide no incremental IC;
+    and (iv)~higher-frequency (4-hour) data degrades performance due
+    to sample overlap, establishing that the signal is daily-scale.
 
     \item We demonstrate that the signal scales with asset universe
     breadth (Sharpe doubles from 60 to 362 assets) and survives
