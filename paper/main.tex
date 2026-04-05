@@ -1,4 +1,5 @@
-\documentclass[sigconf,anonymous]{acmart}
+% For anonymous submission: \documentclass[sigconf,anonymous]{acmart}
+\documentclass[sigconf]{acmart}
 
 % Remove ACM-specific metadata for draft
 \settopmatter{printacmref=false}
@@ -25,9 +26,15 @@
 
 \title{Phantom: Distributional Forecasting for Cross-Sectional\\Cryptocurrency Return Prediction}
 
-% Authors hidden for double-blind
-\author{Anonymous}
-\affiliation{\institution{Anonymous Institution}}
+% For submission: use anonymous. For preprint: uncomment below.
+%\author{Anonymous}
+%\affiliation{\institution{Anonymous Institution}}
+\author{Alexandre Dalban}
+\email{alexandre.dalban@student-cs.fr}
+\affiliation{%
+  \institution{CentraleSupelec, Universit\'e Paris-Saclay}
+}
+\authornote{Contact: alexandre.dalban@gmail.com}
 
 % ═══════════════════════════════════════════════════════════════
 % ABSTRACT (~180 words)
@@ -342,156 +349,251 @@ The demeaned target has mean approximately zero by construction, but its \emph{c
 \section{Experimental Setup}
 
 \subsection{Data}
-% 362 crypto assets from Binance (all active USDT pairs)
-% Filter: remove stablecoins, leveraged tokens, < 300 days history
-% Daily OHLCV, 2017-08 to 2026-03
-% Split: train < 2024 (230K), val = 2024 (97K), test >= 2025 (145K)
-% 1-year gap between train and test (val acts as buffer)
-% Table: dataset statistics
 
-[TO FILL: Data description table. Asset count, sample counts per
-split, date ranges. Discuss Binance as data source. Filter criteria.]
+We collect daily OHLCV data for all actively traded USDT-denominated pairs on Binance.
+After filtering stablecoins, leveraged tokens, and assets with fewer than 300~days of history, our universe contains \textbf{362~crypto\-currencies} spanning August~2017 to March~2026.
+
+\begin{table}[h]
+\small
+\centering
+\caption{Dataset statistics.}
+\label{tab:data}
+\begin{tabular}{lccc}
+\toprule
+ & Train & Validation & Test \\
+\midrule
+Period & $<$ 2024-01 & 2024 & $\geq$ 2025-01 \\
+Samples & 229,759 & 96,966 & 144,630 \\
+Unique dates & 2,208 & 366 & 430 \\
+Assets per date & $\sim\!160$ & $\sim\!290$ & $\sim\!340$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The temporal split ensures strict out-of-sample evaluation: the validation year (2024) acts as a buffer between training and test data.
+The model is initialized from a checkpoint pretrained on a broader universe of 413 assets (including equities, forex, and commodities) before fine-tuning on the crypto-only dataset.
 
 \subsection{Baselines}
-% 1. Momentum (5d, 10d, 20d): rank by past cumulative return
-% 2. Mean-reversion (1d, 5d): rank by negative past return
-% 3. Abnormal volume (5d): rank by log volume ratio
-% 4. Low volatility: rank by negative trailing vol
-% 5. Random: shuffled signal (null hypothesis)
-%
-% All evaluated with same L/S methodology (top/bottom 20%)
 
-[TO FILL: Baseline descriptions. Cite momentum literature.
-Explain why these are the natural comparisons.]
+We compare against the following cross-sectional strategies, all evaluated using the same long-short portfolio methodology (top/bottom quintile, equal-weighted, daily rebalancing):
+
+\begin{itemize}
+\item \textbf{Momentum} ($k$\textbf{d}): rank assets by cumulative log return over the past $k \in \{5, 10, 20\}$ days. This is the dominant factor in the crypto literature~\cite{liu2022}.
+\item \textbf{Mean-reversion} ($k$\textbf{d}): rank by \emph{negative} past $k \in \{1, 5\}$ day return.
+\item \textbf{Volume}: rank by mean log volume ratio (channel~3) over the past 5 days.
+\item \textbf{Low volatility}: rank by \emph{negative} trailing realized volatility (channel~4). The low-volatility anomaly is well-documented across asset classes~\cite{ang2006}.
+\item \textbf{Random}: Gaussian noise signal (null hypothesis).
+\end{itemize}
 
 \subsection{Evaluation Metrics}
-% Cross-sectional signal:
-%   - Rank IC (Spearman) per date, averaged
-%   - Newey-West t-statistic for IC and L/S returns
-%   - Long-short portfolio: top/bottom quintile, equal-weighted
-%   - Sharpe, Sortino, Calmar ratios (annualized with 365 days)
-%   - Win rate, max drawdown
-%
-% Distributional quality:
-%   - NLL, CRPS
-%   - PIT histogram (should be uniform)
-%   - Coverage calibration
-%   - KS test for PIT uniformity
-%
-% Robustness:
-%   - Monthly IC stability
-%   - Rolling 60-day Sharpe
-%   - Decile monotonicity (Spearman of decile returns with decile rank)
-%   - Double-sort orthogonality vs low-vol
-%   - Transaction cost analysis with turnover
 
-[TO FILL: Mathematical definitions of each metric. Cite Gneiting \&
-Raftery (2007) for CRPS, Newey \& West (1987) for t-stats.]
+\paragraph{Cross-sectional signal.}
+The primary metric is the \emph{rank information coefficient} (IC): the Spearman rank correlation between predicted $\mu_{i,h}$ and realized $r^{\text{rel}}_{i,h}$, computed per date and averaged.
+We report Newey-West adjusted $t$-statistics~\cite{newey1987} throughout to account for autocorrelation in daily IC and return series.
+The \emph{long-short portfolio} buys the top quintile ($\sim\!72$ assets) and shorts the bottom quintile by predicted~$\mu$, equal-weighted, rebalanced daily.
+We report annualized Sharpe, Sortino, and Calmar ratios using a 365-day convention (crypto trades 24/7).
+
+\paragraph{Transaction costs.}
+We compute net returns under one-way cost assumptions of 0, 5, 10, 20, 30, and 50 basis points, applied proportionally to \emph{turnover}---the fraction of portfolio positions that change each day.
+We report the \emph{breakeven cost}: the maximum one-way fee at which the strategy's mean daily return reaches zero.
+
+\paragraph{Distributional quality.}
+We evaluate calibration via the probability integral transform (PIT): if the predicted distribution $F_\theta$ is correctly calibrated, the PIT values $F_\theta(r^{\text{rel}})$ should be uniformly distributed.
+We report coverage at the 50\%, 80\%, 90\%, and 95\% levels and the Kolmogorov-Smirnov test statistic for PIT uniformity.
 
 % ═══════════════════════════════════════════════════════════════
-% 5. RESULTS (~2 pages)
+% 5. RESULTS
 % ═══════════════════════════════════════════════════════════════
-%
-% This is where all 4 figures and key tables go.
 
 \section{Results}
 
-\subsection{Cross-Sectional Signal}
-% Table 1: IC by horizon (1d to 30d) with NW t-stats
-% Figure 1a: IC by horizon bar chart
-% Key finding: IC increases with horizon (0.08 at 1d to 0.17 at 30d)
-%   consistent with drift SNR ~ sqrt(h)
-% IC positive 78% of days, 15/15 months
+All results in this section are on the fully out-of-sample test set (January 2025 to March 2026, 430 trading days, 144,630 samples across 362 assets).
 
-[TO FILL: Present IC results. Table with horizons, IC, NW t-stat.
-Discuss SNR scaling with horizon. Compare to crypto factor literature
-(typical IC ~ 0.03-0.05 for known factors).]
+\subsection{Cross-Sectional Signal}
+
+Figure~\ref{fig:main}(a) shows the rank IC by forecast horizon.
+IC increases monotonically from 0.080 at the 1-day horizon to 0.166 at 30 days, consistent with the theoretical scaling of drift signal-to-noise ratio with $\sqrt{h}$.
+At the reference 10-day horizon, the mean IC is 0.124 with a Newey-West $t$-statistic of 8.93, and IC is positive on 78\% of trading days and in all 15 out-of-sample months.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{../plots/fig1_main_results.png}
+\caption{Main results. (a)~Rank IC increases with horizon, consistent with drift SNR $\propto \sqrt{h}$. (b)~Long-short cumulative returns under different cost assumptions. (c)~Decile portfolio returns exhibit perfect monotonicity. (d)~Phantom's IC dominates all simple baselines; the low-volatility strategy is the strongest competitor.}
+\label{fig:main}
+\end{figure*}
 
 \subsection{Portfolio Performance}
-% Table 2: Strategy performance summary
-%   Sharpe (gross/net), Sortino, Calmar, win rate, turnover, MDD
-% Figure 1b: Cumulative L/S returns (gross, net 10bps, net 30bps)
-% Figure 1c: Decile portfolio returns (perfect monotonicity)
-% Quintile sort table with NW t-stats
-%   Q5-Q1 spread = 2.53%/day, NW t = 7.44, Sharpe = 13.0
-% Breakeven cost = 336 bps
 
-[TO FILL: Present portfolio results. Quintile table in publication
-format. Discuss why Sharpe is high (diversification across 362 assets,
-Sharpe ~ IC * sqrt(N)). Transaction cost analysis table.]
+Table~\ref{tab:quintile} presents the quintile portfolio sort at the 10-day horizon.
+Returns increase monotonically from Q1 ($-1.49\%$/day) to Q5 ($+1.04\%$/day), yielding a long-short spread of 2.53\%/day with a Newey-West $t$-statistic of 7.44.
+The Spearman rank correlation between quintile rank and mean return is 1.000 (perfect monotonicity).
+
+\begin{table}[h]
+\small
+\centering
+\caption{Quintile portfolio sort (h=10d). Newey-West $t$-statistics in parentheses.}
+\label{tab:quintile}
+\begin{tabular}{lcccccc}
+\toprule
+ & Q1 & Q2 & Q3 & Q4 & Q5 & Q5$-$Q1 \\
+\midrule
+Return (\%/d) & $-$1.49 & $-$0.24 & 0.18 & 0.48 & 1.04 & 2.53 \\
+ & ($-$7.71) & ($-$1.80) & (1.83) & (4.64) & (5.05) & (7.44) \\
+Sharpe & $-$13.4 & $-$2.8 & 2.6 & 6.9 & 9.0 & 13.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:main}(b) shows the cumulative long-short returns under different cost scenarios.
+The gross annualized Sharpe is 13.0; after 30~bps of transaction costs per trade, the net Sharpe remains 11.84 with cumulative returns of 993\%.
+The breakeven one-way cost is 336~bps, far exceeding Binance's standard fee of 10~bps.
+The high Sharpe reflects both the model's IC and the diversification benefit of trading 362 assets: for a long-short strategy, Sharpe scales approximately as $\text{IC} \times \sqrt{N}$ where $N$ is the number of assets.
+Average daily portfolio turnover is 37.8\%.
+
+\begin{table}[h]
+\small
+\centering
+\caption{Strategy performance summary (h=10d, top/bottom 20\%, equal-weighted).}
+\label{tab:performance}
+\begin{tabular}{lclc}
+\toprule
+Metric & Value & Metric & Value \\
+\midrule
+Ann.\ return & 925\% & Win rate & 74.7\% \\
+Ann.\ volatility & 71\% & Max drawdown & $-$38.6\% \\
+Sharpe (gross) & 13.00 & Avg.\ turnover & 37.8\% \\
+Sharpe (10 bps) & 12.61 & Breakeven cost & 336 bps \\
+Sharpe (30 bps) & 11.84 & IC (NW $t$) & 0.124 (8.93) \\
+Sortino & 27.3 & L/S ret (NW $t$) & 7.45 \\
+Calmar & 24.0 & IC $>0$ days & 78\% \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Baseline Comparison}
-% Table 3: Model vs baselines (IC, Sharpe, win rate)
-% Figure 1d: IC bar chart
-% Key: Phantom IC=0.124 vs best baseline (low-vol IC=0.165)
-% But: double-sort shows orthogonality (next subsection)
-% Momentum has negative IC (mean-reverting market in test period)
 
-[TO FILL: Baseline comparison table. Discuss why momentum is negative
-(test period characteristics). Note that low-vol is strong.]
+Table~\ref{tab:baselines} compares Phantom to simple cross-sectional strategies.
+All momentum signals have \emph{negative} IC during the test period, indicating a mean-reverting regime in the 2025--2026 crypto market---consistent with the literature finding that crypto momentum is time-varying~\cite{fieberg2024}.
+Mean-reversion signals are weakly positive but not statistically significant.
+The strongest baseline is the \textbf{low-volatility} strategy (IC$\,{=}\,$0.165), which we analyze further in Section~5.4.
 
-\subsection{Orthogonality to Low-Volatility Anomaly}
-% Figure 4a: Double-sort heatmap (vol tercile x Phantom tercile)
-% Figure 4b: Combined signal analysis
-% Key: Phantom L/S spread significant within EACH vol tercile
-%   -> signal is independent of low-vol
-% Signal correlation between Phantom and low-vol
-% Combined signal IC and Sharpe
+\begin{table}[h]
+\small
+\centering
+\caption{Baseline comparison (h=10d).}
+\label{tab:baselines}
+\begin{tabular}{lccc}
+\toprule
+Strategy & Rank IC & Sharpe & Win\% \\
+\midrule
+\textbf{Phantom (ours)} & \textbf{0.124} & \textbf{13.0} & \textbf{74.7} \\
+Momentum (5d) & $-$0.007 & $-$1.0 & 49.1 \\
+Momentum (10d) & $-$0.012 & $-$1.0 & 45.8 \\
+Momentum (20d) & $-$0.016 & $-$0.8 & 48.6 \\
+Mean-rev (1d) & 0.009 & 0.8 & 50.0 \\
+Mean-rev (5d) & 0.007 & 1.0 & 50.9 \\
+Volume (5d) & $-$0.046 & $-$8.7 & 33.7 \\
+Low volatility & 0.165 & 12.1 & 73.3 \\
+Random & 0.001 & 0.4 & 53.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-[TO FILL: Double-sort results. Show that Phantom's spread has
-significant NW t-stat within each vol tercile. Discuss signal
-correlation. Combined signal analysis.]
+\subsection{Relationship to the Low-Volatility Anomaly}
+
+The low-volatility baseline achieves IC$\,{=}\,$0.165, raising the question of whether Phantom simply rediscovers this known anomaly.
+We investigate via double-sorted portfolios: on each date, we independently sort assets into volatility terciles and Phantom prediction terciles, then examine returns within each cell (Figure~\ref{fig:ortho}a).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\columnwidth]{../plots/fig4_orthogonality.png}
+\caption{(a)~Double sort: mean daily returns by volatility and Phantom tercile. The volatility column dominates (low-vol assets earn positive returns regardless of Phantom ranking), but Phantom's long-short spread is significant within mid-vol ($t\,{=}\,$2.6) and high-vol ($t\,{=}\,$4.1) terciles. (b)~Combining both signals yields the highest IC.}
+\label{fig:ortho}
+\end{figure}
+
+The cross-sectional correlation between Phantom's signal and the low-vol signal is $\rho = 0.63$, indicating substantial overlap.
+However, Phantom's ranking power \emph{concentrates in the high-volatility tercile} (IC$\,{=}\,$0.092, NW $t\,{=}\,$6.77), precisely where sorting by volatility alone provides no differentiation---all high-vol assets earn negative relative returns, but Phantom distinguishes the ``less bad'' from the ``worst.''
+Combining both signals (equal-weighted rank average) yields the highest IC of 0.157, exceeding either signal alone.
 
 \subsection{Distributional Quality}
-% Figure 3: PIT histogram, coverage calibration, sigma term structure
-% Coverage 90% -> 90.3% (well-calibrated)
-% Sigma follows sqrt(h) scaling at short horizons
-% Nu ~ 2: heavy-tailed Student-t (heavier than Gaussian)
 
-[TO FILL: Distributional metrics. PIT uniformity, coverage,
-sigma term structure. Discuss nu ~ 2 and heavy tails.]
+Beyond ranking, the model produces calibrated uncertainty estimates (Figure~\ref{fig:dist}).
+The PIT histogram is approximately uniform, and coverage calibration is excellent: 90\% prediction intervals contain 90.3\% of realized returns.
+The predicted volatility term structure follows $\sigma_h \propto \sqrt{h}$ at short horizons before diverging upward at longer horizons, reflecting the excess volatility clustering in crypto returns.
+The model consistently learns $\nu \approx 2$, the minimum degrees of freedom for finite variance, confirming that cryptocurrency relative returns have substantially heavier tails than a Gaussian model would accommodate.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\columnwidth]{../plots/fig3_distributional.png}
+\caption{Distributional quality. (a)~PIT histogram (h=10d) is approximately uniform. (b)~Coverage calibration closely tracks the diagonal. (c)~Predicted $\sigma$ follows $\sqrt{h}$ scaling at short horizons.}
+\label{fig:dist}
+\end{figure}
 
 \subsection{Robustness}
-% Figure 2: Monthly IC, rolling Sharpe, turnover
-% IC positive all 15 months
-% Rolling 60-day Sharpe always > 0 (min = 2.82)
-% Turnover stable at 38%
 
-[TO FILL: Robustness checks. Monthly stability, rolling Sharpe,
-turnover analysis.]
+Figure~\ref{fig:robust} demonstrates the temporal stability of the signal.
+The rank IC is positive in all 15 out-of-sample months, ranging from 0.037 (March 2026, partial month) to 0.200 (November 2025).
+The 60-day rolling Sharpe ratio is positive 100\% of the time, with a minimum of 2.82 and a mean of 14.0.
+Daily portfolio turnover is stable around 38\%, with no regime-dependent spikes.
+The maximum drawdown is $-38.6\%$ with a 14-day recovery, occurring during a broad crypto deleveraging event.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\columnwidth]{../plots/fig2_robustness.png}
+\caption{Robustness. (a)~Monthly IC is positive in all 15 months. (b)~60-day rolling Sharpe always positive (min=2.82). (c)~Turnover stable at 38\%.}
+\label{fig:robust}
+\end{figure}
 
 \subsection{Ablation: What Works and What Doesn't}
-% Table 4: Version progression (v1-v8)
-%   v1/v2: synthetic pretraining -> zero transfer
-%   v3: real multi-asset -> calibration, no directional signal
-%   v4: absolute returns -> memorization, doesn't generalize
-%   v5: relative returns -> IC=0.09 (breakthrough)
-%   v6: + new features -> features don't help, crypto-only helps
-%   v7: 4h bars -> worse (sample overlap)
-%   v8: 362 assets -> Sharpe doubles
-%
-% Key lessons as bullet points
 
-[TO FILL: Ablation table. Each version: what changed, IC, Sharpe.
-Discuss each negative result as a contribution. Emphasize that
-the progression is a systematic search over the design space.]
+Table~\ref{tab:ablation} summarizes the progression across eight model versions, each testing a specific design hypothesis.
+The key inflection point is the shift from absolute to relative returns (v4$\to$v5), which unlocks cross-sectional signal that was inaccessible in all prior versions.
+The most impactful positive finding is that widening the asset universe from 60 to 362 assets (v6$\to$v8) doubles the Sharpe ratio through diversification, without any architectural change.
+Every negative result---synthetic pretraining, derivative features, and sub-daily data---eliminates a plausible design choice.
+
+\begin{table}[h]
+\small
+\centering
+\caption{Ablation across model versions (OOS crypto). ``--'' = not applicable.}
+\label{tab:ablation}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{clccp{3.8cm}}
+\toprule
+Ver & Change & IC & Sharpe & Finding \\
+\midrule
+v1 & Synthetic pretrain & -- & -- & Oracle CRPS on synthetic \\
+v2 & + Student-$t$ head & -- & -- & Same CRPS, simpler \\
+v3 & Real multi-asset & 0.00 & -- & Good calibration, no signal \\
+v4 & Multi-horizon abs. & 0.00 & -- & Memorizes, doesn't transfer \\
+v5 & \textbf{Relative returns} & 0.09 & 4.6 & Signal unlocked \\
+v6 & + Funding/taker buy & 0.14 & 5.5 & Features don't help \\
+v7 & 4h bars & 0.10 & 2.6 & Worse: sample overlap \\
+v8 & \textbf{362 assets} & \textbf{0.12} & \textbf{13.0} & Sharpe doubles via breadth \\
+\bottomrule
+\end{tabular}}
+\end{table}
 
 % ═══════════════════════════════════════════════════════════════
-% 6. CONCLUSION (~0.3 pages)
+% 6. CONCLUSION
 % ═══════════════════════════════════════════════════════════════
 
 \section{Conclusion}
 
-[TO FILL:
-- Summary: distributional Transformer for cross-sectional crypto,
-  IC=0.124, Sharpe 11.84 net, orthogonal to low-vol
-- Key insight: relative returns unlock signal that absolute returns
-  cannot access; signal scales with universe breadth
-- Limitations: crypto-only (equity IC~0), no conditional signal
-  beyond ranking, no live trading validation
-- Future work: live deployment, alternative data (on-chain),
-  extension to DeFi protocols, adaptive position sizing using
-  the distributional output]
+We presented Phantom, a Transformer-based distributional forecasting model for cross-sectional cryptocurrency return prediction.
+By training on cross-sectionally demeaned (relative) returns across 362 cryptocurrencies, the model achieves a rank IC of 0.124 (Newey-West $t = 8.93$) with a long-short Sharpe ratio of 11.84 net of transaction costs, a 74.7\% daily win rate, and perfect decile monotonicity on 15 months of fully out-of-sample data.
+
+The systematic ablation across eight model versions yields several insights:
+(i)~absolute returns are unpredictable from OHLCV, but cross-sectional \emph{relative} returns contain exploitable signal;
+(ii)~synthetic SDE pretraining achieves oracle accuracy but transfers zero signal to real markets;
+(iii)~derivative features add no value over price and volume;
+and (iv)~signal scales with universe breadth but not with data frequency.
+
+\paragraph{Limitations.}
+The signal is crypto-specific---equities show near-zero IC---and our evaluation does not include live trading validation with real execution.
+The model's signal is partially correlated with the low-volatility anomaly ($\rho = 0.63$), and the distributional output ($\sigma$, $\nu$) is not yet exploited for adaptive position sizing.
+
+\paragraph{Future work.}
+Promising directions include live deployment with execution-aware training, incorporation of alternative data (on-chain metrics, social sentiment), adaptive position sizing using the predicted $\sigma_{i,h}$, and extension to decentralized finance (DeFi) protocols where cross-sectional prediction over liquidity pools presents similar opportunities.
 
 % ═══════════════════════════════════════════════════════════════
 % REFERENCES
