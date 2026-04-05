@@ -104,6 +104,73 @@ def compute_ohlcv_features(
     return features.astype(np.float32)
 
 
+def compute_ohlcv_features_4h(
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    vol_window: int = 180,
+    mom_window: int = 60,
+) -> np.ndarray:
+    """Compute 6-channel features from 4-hour OHLCV bars.
+
+    Same channels as compute_ohlcv_features() but with windows adjusted
+    for 4h bars (6 bars per day):
+      - Volume median: 180 bars (30 days)
+      - Trailing vol: 180 bars (30 days), annualized by sqrt(252*6)=sqrt(1512)
+      - Momentum: 60 bars (10 days)
+
+    Returns:
+        features: (N-1, 6) float32 array.
+    """
+    n = len(close)
+    if n < 2:
+        raise ValueError(f"Need at least 2 data points, got {n}")
+
+    bars_per_year = 252 * 6  # 1512
+
+    log_returns = np.diff(np.log(close))
+    h = high[1:]
+    l = low[1:]
+    c = close[1:]
+    o = open_[1:]
+    v = volume[1:]
+
+    intraday_range = (h - l) / (c + 1e-10)
+
+    candle_range = h - l + 1e-10
+    body_ratio = (c - o) / candle_range
+    body_ratio = np.clip(body_ratio, -1.0, 1.0)
+
+    vol_series = pd.Series(v)
+    vol_median = vol_series.rolling(vol_window, min_periods=1).median().values
+    log_vol_ratio = np.zeros_like(v, dtype=np.float64)
+    valid_vol = (v > 0) & (vol_median > 0)
+    log_vol_ratio[valid_vol] = np.log(v[valid_vol] / vol_median[valid_vol])
+
+    ret_series = pd.Series(log_returns)
+    trailing_vol = ret_series.rolling(vol_window, min_periods=30).std().values * np.sqrt(bars_per_year)
+    expanding_vol = ret_series.expanding(min_periods=10).std().values * np.sqrt(bars_per_year)
+    nan_mask = np.isnan(trailing_vol)
+    trailing_vol[nan_mask] = expanding_vol[nan_mask]
+    trailing_vol = np.nan_to_num(trailing_vol, nan=0.0)
+
+    momentum = ret_series.rolling(mom_window, min_periods=1).sum().values
+
+    features = np.column_stack([
+        log_returns, intraday_range, body_ratio,
+        log_vol_ratio, trailing_vol, momentum,
+    ])
+
+    bad = ~np.isfinite(features)
+    if bad.any():
+        warnings.warn(f"Replaced {bad.sum()} non-finite values in 4h features")
+        features[bad] = 0.0
+
+    return features.astype(np.float32)
+
+
 def compute_ohlcv_features_v6(
     open_: np.ndarray,
     high: np.ndarray,
