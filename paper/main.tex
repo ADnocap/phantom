@@ -199,92 +199,140 @@ Our finding that the model consistently pushes $\nu \to 2$ (the minimum for fini
 \section{Methodology}
 
 \subsection{Problem Formulation}
-% Define:
-% - Universe of N assets, daily OHLCV observations
-% - Context window x_{t-L:t} of L=120 days, C=6 channels
-% - Target: relative return r^{rel}_{i,t+h} = r_{i,t+h} - \bar{r}_{t+h}
-%   where \bar{r}_{t+h} = (1/N_t) \sum_j r_{j,t+h}
-% - Model outputs p(r^{rel}_{i,t+h} | x_{i,t-L:t}) = Student-t(\mu, \sigma, \nu)
-%   for h = 1, ..., H (H=30)
-% - Cross-sectional ranking: rank assets by \mu_{i,h} on each date
 
-[TO FILL: Formal mathematical problem definition. Define notation
-for assets $i \in \{1, \ldots, N_t\}$, context $\mathbf{x}_i \in \mathbb{R}^{L \times C}$,
-relative return $r^{\text{rel}}_{i,h}$, predictive distribution
-$p_\theta(r^{\text{rel}}_{i,h} | \mathbf{x}_i)$. State the dual objective:
-(1) calibrated distributional forecasts, (2) cross-sectional ranking signal.]
+Let $\mathcal{A}_t = \{1, \ldots, N_t\}$ denote the set of actively traded cryptocurrency assets on date~$t$.
+For each asset~$i$, we observe a context window of daily OHLCV (open, high, low, close, volume) data spanning $L = 120$ trading days, from which we compute a feature matrix $\mathbf{x}_i \in \mathbb{R}^{L \times C}$ with $C = 6$ channels (Section~3.2).
+We define the \emph{cumulative log return} of asset~$i$ over the next~$h$ days as
+\begin{equation}
+r_{i,t,h} = \sum_{k=1}^{h} \log\!\left(\frac{c_{i,t+k}}{c_{i,t+k-1}}\right)
+\end{equation}
+where $c_{i,t}$ is the closing price.
+To isolate idiosyncratic signal from shared market movements, we work with \emph{relative returns} (Section~3.5):
+\begin{equation}
+r^{\text{rel}}_{i,t,h} = r_{i,t,h} - \frac{1}{N_t}\sum_{j \in \mathcal{A}_t} r_{j,t,h}
+\label{eq:relative}
+\end{equation}
+
+The model $f_\theta$ produces a parametric predictive distribution for each asset and horizon simultaneously:
+\begin{equation}
+f_\theta(\mathbf{x}_i) = \bigl\{(\mu_{i,h},\, \sigma_{i,h},\, \nu_{i,h})\bigr\}_{h=1}^{H}, \quad H = 30
+\end{equation}
+where each triplet parameterizes a Student-$t$ distribution: $r^{\text{rel}}_{i,t,h} \sim \text{Student-}t(\mu_{i,h},\, \sigma_{i,h},\, \nu_{i,h})$.
+The model serves a dual objective: (1)~\emph{calibrated distributional forecasts}---the predicted distributions should match the empirical frequency of outcomes---and (2)~\emph{cross-sectional ranking signal}---on each date, the predicted location parameters $\{\mu_{i,h}\}_{i \in \mathcal{A}_t}$ should rank assets in an order correlated with their actual relative performance.
 
 \subsection{Feature Engineering}
-% 6 OHLCV channels:
-% Ch 0: log return = log(c_t / c_{t-1})
-% Ch 1: intraday range = (h_t - l_t) / c_t  (Parkinson vol proxy)
-% Ch 2: body ratio = (c_t - o_t) / (h_t - l_t)  (candle body)
-% Ch 3: log volume ratio = log(v_t / median_{30}(v))
-% Ch 4: trailing vol = std_{30}(r) * sqrt(252)
-% Ch 5: momentum = sum_{10}(r)
-%
-% Emphasize: NO normalization (RevIN/MeanAbsScaling destroy signal)
-% All features are asset-universal (work for any tradeable asset)
 
-[TO FILL: Mathematical definition of each channel. Table of channels
-with name, formula, intuition. Discuss why no normalization.]
+From raw OHLCV data $(o_t, h_t, l_t, c_t, v_t)$ for each asset, we compute six channels that are universal across all tradeable assets:
+
+\begin{table}[h]
+\small
+\centering
+\caption{Input feature channels.}
+\label{tab:features}
+\begin{tabular}{clc}
+\toprule
+Ch & Feature & Formula \\
+\midrule
+0 & Log return & $\log(c_t / c_{t-1})$ \\
+1 & Intraday range & $(h_t - l_t) / c_t$ \\
+2 & Body ratio & $(c_t - o_t) / (h_t - l_t)$ \\
+3 & Log volume ratio & $\log\bigl(v_t / \widetilde{v}_{30}\bigr)$ \\
+4 & Trailing volatility & $\hat{\sigma}_{30} \cdot \sqrt{252}$ \\
+5 & Momentum & $\textstyle\sum_{k=0}^{9} r_{t-k}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Here $\widetilde{v}_{30}$ is the 30-day rolling median volume and $\hat{\sigma}_{30}$ is the 30-day rolling standard deviation of log returns, annualized by $\sqrt{252}$.
+Channels 1--2 capture intraday price dynamics (volatility and candle structure), channels 3--4 capture volume and realized volatility, and channel~5 captures short-term trend.
+Critically, we apply \emph{no instance normalization} (e.g., RevIN~\cite{kim2022}) or mean-absolute scaling, as our ablation studies (Section~5.7) found that such normalizations destroy the cross-sectional signal by removing the relative magnitude differences between assets that the model exploits for ranking.
 
 \subsection{Model Architecture}
-% Patched Transformer encoder:
-%   - Input: x \in R^{L x C}, patch_len=5, stride=5 -> N=24 patches
-%   - Patch embedding: flatten (C x patch_len) -> Linear -> d_model=512
-%   - Positional encoding (learned)
-%   - 8-layer Transformer encoder (pre-norm, GELU, d_ff=2048)
-%
-% Cross-attention decoder:
-%   - Horizon embedding: h -> R^{d_model} (learned, h=1..30)
-%   - 2-layer cross-attention: query=horizon_embed, key/value=encoder_out
-%   - All 30 horizons decoded simultaneously (batched queries)
-%
-% Student-t head:
-%   - Linear(d_model) -> (\mu, log\sigma, log\nu)
-%   - sigma = exp(log_sigma), clamped to [exp(-7), exp(2)]
-%   - nu = exp(log_nu), clamped to [2.01, 100]
-%   - Output: Student-t(mu, sigma, nu) per horizon
-%
-% Anti-collapse mechanisms:
-%   - Condition dropout (p=0.15): zero encoder output with probability p
-%     during training -> classifier-free guidance at inference
-%   - Encoder variance penalty: encourage diverse representations
-%
-% Architecture figure reference
 
-[TO FILL: Full mathematical description of each component. Include
-architecture diagram (Figure). Equation for patch embedding,
-cross-attention, Student-t parameterization. Discuss anti-collapse.]
+\paragraph{Patched encoder.}
+The input $\mathbf{x}_i \in \mathbb{R}^{L \times C}$ is segmented into $N$ non-overlapping patches of length~$P$:
+\begin{equation}
+\mathbf{p}_n = \text{vec}\!\left(\mathbf{x}_i[nP{:}(n{+}1)P,\, :]\right) \in \mathbb{R}^{PC}, \quad n = 0, \ldots, N{-}1
+\end{equation}
+where $N = L/P$ (we use $P = 5$, giving $N = 24$ patches).
+Each patch is linearly projected and combined with a learned positional encoding:
+\begin{equation}
+\mathbf{z}_n^{(0)} = \mathbf{W}_{\text{proj}}\, \mathbf{p}_n + \mathbf{e}_n, \quad \mathbf{W}_{\text{proj}} \in \mathbb{R}^{d \times PC},\; \mathbf{e}_n \in \mathbb{R}^d
+\end{equation}
+with $d = 512$.
+The sequence $\mathbf{Z}^{(0)} = [\mathbf{z}_0^{(0)}, \ldots, \mathbf{z}_{N-1}^{(0)}]$ is processed by an $M$-layer pre-norm Transformer encoder ($M = 8$) with GELU activation, $d_{\text{ff}} = 2048$, and 8 attention heads, producing contextualized representations $\mathbf{Z}^{(M)} \in \mathbb{R}^{N \times d}$.
+
+\paragraph{Cross-attention decoder.}
+To predict distributions at all $H = 30$ horizons simultaneously, we use a cross-attention decoder.
+Each horizon $h \in \{1, \ldots, H\}$ is mapped to a query vector via a learned embedding table $\mathbf{E}_h \in \mathbb{R}^d$.
+All 30 queries attend to the encoder output in parallel through $D = 2$ cross-attention layers:
+\begin{align}
+\mathbf{q}_h^{(\ell)} &= \mathbf{q}_h^{(\ell-1)} + \text{CrossAttn}\!\left(\text{LN}(\mathbf{q}_h^{(\ell-1)}),\, \mathbf{Z}^{(M)}\right) \label{eq:cross-attn} \\
+\mathbf{q}_h^{(\ell)} &= \mathbf{q}_h^{(\ell)} + \text{FFN}\!\left(\text{LN}(\mathbf{q}_h^{(\ell)})\right) \nonumber
+\end{align}
+where $\mathbf{q}_h^{(0)} = \mathbf{E}_h$ and LN denotes LayerNorm.
+This batched decoding is computationally efficient: all 30 horizons are decoded in a single forward pass with complexity $O(H \cdot N \cdot d)$.
+
+\paragraph{Student-$t$ output head.}
+The decoded vector $\mathbf{q}_h^{(D)} \in \mathbb{R}^d$ for each horizon is mapped to distribution parameters via a two-layer MLP:
+\begin{align}
+(\hat{\mu},\, \log\hat{\sigma},\, \log\hat{\nu}) &= \mathbf{W}_2\,\text{GELU}(\mathbf{W}_1\, \mathbf{q}_h^{(D)} + \mathbf{b}_1) + \mathbf{b}_2 \label{eq:head} \\
+\sigma_h &= \exp\!\left(\text{clamp}(\log\hat{\sigma},\, -7,\, 2)\right) \nonumber \\
+\nu_h &= \exp\!\left(\text{clamp}(\log\hat{\nu},\, \log 2.01,\, \log 100)\right) \nonumber
+\end{align}
+The clamping ensures $\sigma_h \in [e^{-7}, e^2]$ and $\nu_h \in [2.01, 100]$.
+The lower bound $\nu > 2$ guarantees finite variance; our ablation finds the model consistently pushes $\nu \approx 2$, indicating maximally heavy-tailed distributions.
+
+\paragraph{Condition dropout.}
+During training, the encoder output is zeroed with probability $p_{\text{drop}} = 0.15$:
+\begin{equation}
+\tilde{\mathbf{Z}}^{(M)} = \mathbf{Z}^{(M)} \cdot \mathbf{m}, \quad m_i \sim \text{Bernoulli}(1 - p_{\text{drop}})
+\end{equation}
+applied per sample (not per token).
+This trains the decoder to produce reasonable predictions even without encoder input, preventing the decoder from learning to ignore the encoder via its residual connection---an analog of classifier-free guidance in diffusion models.
 
 \subsection{Training Objective}
-% Multi-component loss:
-%   L = L_NLL + 0.5 * L_CRPS + 0.3 * L_MSE + 0.1 * L_var
-%
-% L_NLL = -log p(y | mu, sigma, nu)  (Student-t NLL)
-% L_CRPS = closed-form CRPS for Student-t
-% L_MSE = weighted MSE on predicted mean, sqrt(h) weighting, h >= 5
-% L_var = encoder variance penalty
-%
-% Horizon weighting: sqrt(h/H) emphasizes longer horizons
-%   where SNR ~ sqrt(h)
 
-[TO FILL: Loss function equations. Explain each component and why
-it's needed. CRPS definition and why it's a proper scoring rule.
-Horizon weighting motivation from drift SNR scaling.]
+The loss function combines four terms:
+\begin{equation}
+\mathcal{L} = \lambda_{\text{NLL}}\,\mathcal{L}_{\text{NLL}} + \lambda_{\text{CRPS}}\,\mathcal{L}_{\text{CRPS}} + \lambda_{\text{MSE}}\,\mathcal{L}_{\text{MSE}} + \lambda_{\text{var}}\,\mathcal{L}_{\text{var}}
+\label{eq:loss}
+\end{equation}
+with weights $\lambda_{\text{NLL}} = 1.0$, $\lambda_{\text{CRPS}} = 0.5$, $\lambda_{\text{MSE}} = 0.3$, $\lambda_{\text{var}} = 0.1$.
+
+\paragraph{Negative log-likelihood.}
+The primary loss is the NLL of the observed relative return under the predicted Student-$t$ distribution, averaged across all horizons and samples:
+\begin{equation}
+\mathcal{L}_{\text{NLL}} = -\frac{1}{BH}\sum_{b,h} \log\, p\!\left(r^{\text{rel}}_{b,h} \mid \mu_{b,h}, \sigma_{b,h}, \nu_{b,h}\right)
+\end{equation}
+where $p(\cdot \mid \mu, \sigma, \nu)$ is the Student-$t$ density.
+
+\paragraph{CRPS.}
+The CRPS term (Eq.~\ref{eq:crps}) is evaluated on a subset of horizons $\{1, 5, 10, 15, 20, 25, 30\}$ days using the sample-based representation with 256 Monte Carlo draws from the predicted distribution.
+
+\paragraph{Mean MSE with horizon weighting.}
+To encourage non-trivial conditional means (preventing collapse to $\mu = 0$), we add a weighted MSE loss on the predicted mean:
+\begin{equation}
+\mathcal{L}_{\text{MSE}} = \frac{1}{B}\sum_b \sum_{h=h_{\min}}^{H} w_h \left(\mu_{b,h} - r^{\text{rel}}_{b,h}\right)^2, \quad w_h = \sqrt{h/H}
+\label{eq:mse}
+\end{equation}
+The $\sqrt{h}$ weighting reflects the signal-to-noise ratio of drift: for a random walk with drift~$\delta$, $\text{SNR}(h) = \delta\sqrt{h}/\sigma \propto \sqrt{h}$.
+We set $h_{\min} = 5$ to avoid penalizing mean predictions at very short horizons where SNR is negligible.
+
+\paragraph{Encoder variance penalty.}
+To prevent representation collapse (all encoder outputs becoming identical regardless of input), we add a penalty on the variance of encoder representations across the batch:
+$\mathcal{L}_{\text{var}} = -\text{Var}_b\!\left[\bar{\mathbf{z}}_b\right]$
+where $\bar{\mathbf{z}}_b$ is the mean-pooled encoder output for sample~$b$.
 
 \subsection{Cross-Sectional Demeaning}
-% Relative return computation:
-%   r^{rel}_{i,t,h} = r^{abs}_{i,t,h} - (1/N_t) * sum_j r^{abs}_{j,t,h}
-%
-% Why: removes shared market factor (beta), isolates idiosyncratic signal
-% Computed offline over all (date, asset) pairs
-% 99.9% of samples adjusted (groups with >= 3 assets)
 
-[TO FILL: Mathematical formulation. Explain why this removes
-market beta. Connection to Fama-French methodology. Discuss
-minimum group size.]
+The relative return (Eq.~\ref{eq:relative}) removes the shared market factor from each asset's return on each date.
+If all assets rise 5\% but asset~$i$ rises 8\%, its relative return is $+3\%$; an asset rising only 2\% receives $-3\%$.
+This is analogous to the market-adjustment step in Fama-MacBeth regressions and serves two purposes: (1)~it makes the prediction task \emph{market-neutral}, so the model need not predict market direction, and (2)~it isolates the \emph{idiosyncratic} component of returns that drives cross-sectional dispersion.
+
+The demeaning is computed offline over all $(t, h)$ pairs before training.
+We require a minimum of 3 assets per date; 99.9\% of samples are adjusted.
+The demeaned target has mean approximately zero by construction, but its \emph{cross-sectional variance} varies substantially across dates and horizons---this variance is what the model's $\sigma_{i,h}$ learns to predict.
 
 % ═══════════════════════════════════════════════════════════════
 % 4. EXPERIMENTAL SETUP (~0.8 pages)
