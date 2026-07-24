@@ -76,12 +76,12 @@ Eight model versions systematically test the design space:
 | v1-v2 | Synthetic SDE pretrain | - | - | Oracle CRPS on synthetic, zero transfer to real |
 | v3 | Real multi-asset pretrain | 0.00 | - | Good calibration, no directional signal |
 | v4 | Multi-horizon absolute returns | 0.00 | - | Memorizes training, doesn't generalize |
-| **v5** | **Relative returns** | **0.09** | **4.6** | **Signal unlocked** |
-| v6 | + Funding rate, taker buy | 0.14 | 5.5 | Features don't help; crypto-only helps |
-| v7 | 4h bars | 0.10 | 2.6 | Worse: 99.7% sample overlap, signal is daily |
+| **v5** | **Relative returns** | **0.09** | **~1.5*** | **Signal unlocked** |
+| v6 | + Funding rate, taker buy | 0.14 | ~1.7* | Features don't help; crypto-only helps |
+| v7 | 4h bars | 0.10 | ~0.8* | Worse: 99.7% sample overlap, signal is daily |
 | **v8** | **362 crypto assets** | **0.12** | **~4.1*** | **Breadth improves L/S diversification; IC slightly lower than v6** |
 
-\* Sharpe values in this table were originally computed by annualizing overlapping 10-day returns with sqrt(365), inflating them by ~sqrt(10); the corrected v8 gross figure is shown. All are gross, equal-weighted, on a survivor universe.
+\* Sharpe values in this table were originally computed by annualizing overlapping 10-day returns with sqrt(365), inflating them by ~sqrt(10); corrected figures are shown for all versions (pre-correction: 4.6 / 5.5 / 2.6 / 13.0). All are gross, equal-weighted, on a survivor universe.
 
 ---
 

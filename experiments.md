@@ -1,5 +1,7 @@
 # Phantom Experiments Log
 
+> **2026-07-24 correction note**: post-hoc audit found sqrt(10) Sharpe inflation from overlapping-return annualization + survivorship-biased universe; headline Sharpe values in this log are pre-correction — see README Limitations.
+
 ## Summary
 
 Across 15+ experiments over pretraining and fine-tuning, the model achieves **CRPS 0.0288 on real BTC test data (2023-07 to 2026)**, matching the post-hoc Gaussian baseline (0.0287). The model provides well-calibrated distributional forecasts (ECE=0.012, 90%→93% coverage) but cannot beat a simple Gaussian with the correct mean and std.
@@ -420,7 +422,7 @@ The failure reveals that **data quantity ≠ information quantity** when samples
 | NLL | -1.081 | -0.916 | +0.165 |
 | Coverage 50% | 51.2% | 47.7% | -3.5% |
 | Coverage 90% | 92.0% | 90.3% | -1.7% |
-| IC t-stat (10d) | ~13.1 | **17.2** | +4.1 |
+| IC t-stat (10d, Newey-West) | — | **8.93** | — |
 
 **latest.pt (step 67,248, highest mu spread):**
 
@@ -437,7 +439,7 @@ The failure reveals that **data quantity ≠ information quantity** when samples
 
 ### Key Findings
 
-1. **L/S Sharpe doubled (5.46→10.80)** — wider cross-section (362 vs 60 assets) provides massive diversification within each leg. Sharpe scales with sqrt(N_assets).
+1. **L/S Sharpe doubled (5.46→10.80)** — wider cross-section (362 vs 60 assets) provides diversification within each leg; Sharpe scales with sqrt(N_assets). *[2026-07-24 correction: this doubling is a mechanical breadth effect — IC actually fell (0.140→0.124) — and both Sharpe values carry the ~sqrt(10) overlapping-return inflation; horizon-corrected they are ≈1.7→≈3.4, gross, on a survivor-biased universe.]*
 2. **Win rate jumped to 75%** — 3 out of 4 days the model correctly ranks the top/bottom quintiles. Strongest result across all versions.
 3. **IC decreased slightly at 10-30d** compared to v6 — the 362-asset universe includes many small/illiquid coins with noisy returns, which drags down average IC. But the L/S strategy benefits more from diversification than it loses from lower IC.
 4. **Corr(mean, actual) nearly doubled (0.062→0.092)** — the model produces genuinely predictive means, not just good rankings.
@@ -452,7 +454,9 @@ The failure reveals that **data quantity ≠ information quantity** when samples
 | v5 | 413 (all) | 0.092 | 4.55 | Relative returns |
 | v6 | 60 (crypto) | 0.140 | 5.46 | Crypto-only |
 | v7 | 60 (crypto, 4h) | 0.095 | 2.61 | 4h bars (failed) |
-| **v8** | **362 (crypto)** | **0.124** | **10.80** | **Wider cross-section** |
+| **v8** | **362 (crypto)** | **0.124** | **10.80*** | **Wider cross-section (mechanical diversification gain; IC fell vs v6)** |
+
+\* *2026-07-24 correction: all Sharpe values in this column annualize overlapping 10-day returns as if daily, inflating them by ~sqrt(10). Horizon-corrected: v5 ≈ 1.4, v6 ≈ 1.7, v7 ≈ 0.8, v8 ≈ 3.4 (all gross, survivor-biased universe — see README Limitations). Note: the final publication pipeline (final checkpoint and data) measured v8 at 13.0 pre-correction, ≈ 4.1 corrected; the difference vs this log's 10.80 reflects that later run, not a further error.*
 
 ---
 
@@ -468,7 +472,7 @@ The failure reveals that **data quantity ≠ information quantity** when samples
 | Multi-horizon decoding | v4+ | Efficient batched 30-query cross-attention |
 | Relative return targets | v5+ | IC=0.09 cross-sectional signal from OHLCV |
 | Crypto-only training | v6+ | Removing non-crypto noise boosts signal |
-| **Wider crypto cross-section** | **v8** | **362 assets: Sharpe 5.46→10.80, win rate 65%→75%** |
+| **Wider crypto cross-section** | **v8** | **362 assets: L/S diversification gain (pre-correction Sharpe 5.46→10.80, horizon-corrected ≈1.7→≈3.4 gross); IC slightly lower (0.140→0.124); win rate of overlapping 10d windows 65%→75%** |
 
 ## What Didn't Work (final)
 

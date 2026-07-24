@@ -33,6 +33,16 @@ from src.model import PhantomConfig, PhantomModel
 #  UTILITIES
 # ═══════════════════════════════════════════════════════════════════
 
+# All portfolio analyses in this script use the h_ref=9 slice, i.e. 10-day
+# forward returns sampled DAILY. The resulting L/S series is overlapping
+# (each observation spans 10 days), so annualizing it as if the returns were
+# daily inflates Sharpe/Sortino/return figures by ~sqrt(10). All annualized
+# metrics below divide out this factor ("horizon-corrected"). Results are
+# gross of spread/impact/borrow and computed on a survivor-biased universe
+# (pairs delisted before data collection are excluded) — upper bounds.
+HORIZON_DAYS = 10
+
+
 def load_model(ckpt_path):
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     cfg_dict = ckpt['config']
@@ -91,11 +101,20 @@ def long_short_returns(pred, actual, dates, quantile=0.2, min_assets=10):
     return np.array(rets), np.array(valid_dates)
 
 
-def sharpe(returns, annual_factor=365):
-    """Annualized Sharpe. Uses 365 for crypto (24/7 trading)."""
+def sharpe(returns, annual_factor=365, horizon_days=HORIZON_DAYS):
+    """Annualized Sharpe, horizon-corrected. Uses 365 for crypto (24/7 trading).
+
+    `returns` is a daily-sampled series of `horizon_days`-day returns
+    (overlapping). Annualizing with sqrt(365) alone would treat them as
+    daily returns and inflate Sharpe by ~sqrt(horizon_days); dividing the
+    annualization factor by horizon_days corrects this (equivalent, up to
+    residual autocorrelation, to computing on non-overlapping
+    horizon-length blocks). Gross, survivor-biased universe — upper bound.
+    Pass horizon_days=1 for a genuinely daily series.
+    """
     if len(returns) == 0 or returns.std() == 0:
         return 0.0
-    return returns.mean() / returns.std() * np.sqrt(annual_factor)
+    return returns.mean() / returns.std() * np.sqrt(annual_factor / horizon_days)
 
 
 def newey_west_tstat(x, max_lag=None):
@@ -124,22 +143,28 @@ def max_drawdown(returns):
     return dd.min()
 
 
-def sortino(returns, annual_factor=365):
-    """Sortino ratio (downside deviation only)."""
+def sortino(returns, annual_factor=365, horizon_days=HORIZON_DAYS):
+    """Sortino ratio (downside deviation only), horizon-corrected (see sharpe)."""
     if len(returns) == 0:
         return 0.0
     downside = returns[returns < 0]
     if len(downside) == 0 or downside.std() == 0:
         return float('inf')
-    return returns.mean() / downside.std() * np.sqrt(annual_factor)
+    return returns.mean() / downside.std() * np.sqrt(annual_factor / horizon_days)
 
 
-def calmar(returns, annual_factor=365):
-    """Calmar ratio (annualized return / max drawdown)."""
+def calmar(returns, annual_factor=365, horizon_days=HORIZON_DAYS):
+    """Calmar ratio (annualized return / max drawdown), horizon-corrected.
+
+    The mean of a daily-sampled series of `horizon_days`-day returns is a
+    per-horizon (not per-day) return, so the annualized return is
+    mean * annual_factor / horizon_days. Note the drawdown denominator is
+    still measured on the overlapping cumulated series and is indicative only.
+    """
     mdd = abs(max_drawdown(returns))
     if mdd == 0:
         return float('inf')
-    ann_ret = returns.mean() * annual_factor
+    ann_ret = returns.mean() * annual_factor / horizon_days
     return ann_ret / mdd
 
 
@@ -147,17 +172,30 @@ def calmar(returns, annual_factor=365):
 #  1. TRANSACTION COST ANALYSIS
 # ═══════════════════════════════════════════════════════════════════
 
-def transaction_cost_analysis(pred, actual, dates, quantile=0.2):
-    """Analyze strategy profitability under various cost assumptions."""
+def transaction_cost_analysis(pred, actual, dates, quantile=0.2, asset_ids=None):
+    """Analyze strategy profitability under various cost assumptions.
+
+    asset_ids: per-sample asset identifiers aligned with pred/dates. Required
+    for a correct turnover estimate — positional indices within each date's
+    mask do not identify the same asset across dates when the cross-section's
+    composition changes.
+    """
     print("\n" + "="*60)
     print("1. TRANSACTION COST ANALYSIS")
+    print("  (gross, horizon-corrected, survivor-biased universe — upper bound)")
     print("="*60)
 
     ls_rets, ls_dates = long_short_returns(pred, actual, dates, quantile)
-    gross_sharpe = sharpe(ls_rets)
+    gross_sharpe = sharpe(ls_rets)  # horizon-corrected (see sharpe())
     gross_cum = np.cumsum(ls_rets)
 
-    # Turnover: fraction of portfolio that changes each day
+    # Turnover: fraction of quintile membership that changes each day.
+    # Selections must be compared as ASSET IDS, not positional indices:
+    # np.argsort(p) yields positions within the date's mask, which point to
+    # different assets on different dates as the cross-section changes.
+    if asset_ids is None:
+        print("\n  WARNING: no asset_ids provided — turnover compares positional "
+              "indices across dates and is unreliable when universe composition changes.")
     unique = np.unique(dates)
     turnovers = []
     prev_top, prev_bot = None, None
@@ -168,8 +206,15 @@ def transaction_cost_analysis(pred, actual, dates, quantile=0.2):
         p = pred[m]
         n = m.sum()
         k = max(1, int(n * quantile))
-        top = set(np.argsort(p)[-k:])
-        bot = set(np.argsort(p)[:k])
+        top_pos = np.argsort(p)[-k:]
+        bot_pos = np.argsort(p)[:k]
+        if asset_ids is not None:
+            ids = asset_ids[m]
+            top = set(ids[top_pos].tolist())
+            bot = set(ids[bot_pos].tolist())
+        else:
+            top = set(top_pos.tolist())
+            bot = set(bot_pos.tolist())
         if prev_top is not None:
             # One-sided turnover: fraction of positions replaced
             top_turn = 1 - len(top & prev_top) / max(len(top), 1)
@@ -178,9 +223,10 @@ def transaction_cost_analysis(pred, actual, dates, quantile=0.2):
         prev_top, prev_bot = top, bot
 
     avg_turnover = np.mean(turnovers) if turnovers else 0
-    print(f"\n  Average daily turnover: {avg_turnover*100:.1f}%")
-    print(f"  Gross Sharpe: {gross_sharpe:.2f}")
-    print(f"  Gross cumulative: {gross_cum[-1]*100:.1f}%")
+    print(f"\n  Average daily quintile-membership turnover: {avg_turnover*100:.1f}%")
+    print(f"  Gross Sharpe (horizon-corrected): {gross_sharpe:.2f}")
+    print(f"  Gross cumulative (overlapping {HORIZON_DAYS}d spreads, "
+          f"not an equity curve): {gross_cum[-1]*100:.1f}%")
 
     # Cost scenarios (one-way cost in bps, applied to turnover)
     # Total daily cost = 2 * one_way_cost * turnover (buy + sell)
@@ -199,17 +245,21 @@ def transaction_cost_analysis(pred, actual, dates, quantile=0.2):
 
     for name, cost_bps in cost_scenarios.items():
         daily_cost = 2 * (cost_bps / 10000) * avg_turnover
-        net_rets = ls_rets - daily_cost
-        net_sh = sharpe(net_rets)
+        # ls_rets are 10-DAY holding returns sampled daily, while daily_cost
+        # is paid every day: each holding-period observation bears
+        # HORIZON_DAYS days of rebalancing cost.
+        net_rets = ls_rets - daily_cost * HORIZON_DAYS
+        net_sh = sharpe(net_rets)  # horizon-corrected
         net_cum = np.cumsum(net_rets)[-1]
         results[name] = {'sharpe': net_sh, 'cumulative': net_cum, 'daily_cost': daily_cost}
         print(f"  {name:<30} {daily_cost*100:>10.3f}% {net_sh:>12.2f} {net_cum*100:>10.1f}%")
 
-    # Breakeven cost
+    # Breakeven cost: mean_ret is per HORIZON_DAYS-day holding window, so the
+    # daily P&L it must cover is mean_ret / HORIZON_DAYS.
     if gross_sharpe > 0 and avg_turnover > 0:
         mean_ret = ls_rets.mean()
-        breakeven_bps = (mean_ret / (2 * avg_turnover)) * 10000
-        print(f"\n  Breakeven one-way cost: {breakeven_bps:.0f} bps")
+        breakeven_bps = (mean_ret / HORIZON_DAYS / (2 * avg_turnover)) * 10000
+        print(f"\n  Breakeven one-way cost (horizon-corrected): {breakeven_bps:.0f} bps")
     else:
         breakeven_bps = 0
 
@@ -448,9 +498,11 @@ def orthogonality_analysis(X, Y_rel, dates, model_pred, h_ref=9):
     combined_ics = np.array(combined_ics)
     combined_ls = np.array(combined_ls)
     print(f"    Combined IC: {combined_ics.mean():.4f} (NW t={newey_west_tstat(combined_ics):.2f})")
-    print(f"    Combined Sharpe: {sharpe(combined_ls):.2f}")
-    print(f"    vs Phantom alone: IC={np.mean([ic for ic in phantom_ic_within_vol[0]] + [ic for ic in phantom_ic_within_vol[1]] + [ic for ic in phantom_ic_within_vol[2]]):.4f}, Sharpe=13.00")
-    print(f"    vs Low-Vol alone: IC=0.165, Sharpe=12.11")
+    print(f"    Combined Sharpe (horizon-corrected): {sharpe(combined_ls):.2f}")
+    # Reference values are horizon-corrected (earlier drafts quoted 13.0/12.1,
+    # inflated ~sqrt(10) by naive daily annualization of overlapping 10d returns).
+    print(f"    vs Phantom alone: IC={np.mean([ic for ic in phantom_ic_within_vol[0]] + [ic for ic in phantom_ic_within_vol[1]] + [ic for ic in phantom_ic_within_vol[2]]):.4f}, Sharpe~4.1 (gross, horizon-corrected)")
+    print(f"    vs Low-Vol alone: IC=0.165, Sharpe~3.8 (gross, horizon-corrected)")
 
     return {
         'phantom_ic_within_vol': {vol_names[vt]: np.mean(phantom_ic_within_vol[vt])
@@ -501,7 +553,7 @@ def decile_analysis(pred, actual, dates, h_ref=9, n_quantiles=10):
         print(f"  {label:<10} {means[q]*100:>9.3f}% {stds[q]*100:>9.3f}%")
 
     spread = means[-1] - means[0]
-    print(f"\n  Long-Short spread: {spread*100:.3f}% per day")
+    print(f"\n  Long-Short spread: {spread*100:.3f}% per {HORIZON_DAYS}-day holding window")
     print(f"  Monotonicity: {_monotonicity(means):.2f}")
 
     return {'means': means, 'stds': stds, 'spread': spread}
@@ -559,7 +611,7 @@ def robustness_analysis(pred, actual, dates, h_ref=9):
         rolling_sharpe.append(sharpe(w))
     rolling_sharpe = np.array(rolling_sharpe)
 
-    print(f"\n  Rolling 60-day Sharpe:")
+    print(f"\n  Rolling 60-day Sharpe (horizon-corrected):")
     print(f"    Mean: {rolling_sharpe.mean():.2f}")
     print(f"    Min:  {rolling_sharpe.min():.2f}")
     print(f"    Max:  {rolling_sharpe.max():.2f}")
@@ -629,12 +681,14 @@ def plot_publication_figures(pred, actual, dates, sigma, nu, X,
 
     for cost_name, cost_bps in [('10 bps', 10), ('30 bps', 30)]:
         daily_cost = 2 * (cost_bps / 10000) * cost_results['avg_turnover']
-        cum_net = np.cumsum(ls_rets - daily_cost) * 100
+        # Each observation is a HORIZON_DAYS-day holding return; it bears
+        # HORIZON_DAYS days of daily rebalancing cost.
+        cum_net = np.cumsum(ls_rets - daily_cost * HORIZON_DAYS) * 100
         axes[0, 1].plot(cum_net, lw=1.5, ls='--', label=f'Net ({cost_name})')
 
     axes[0, 1].set_xlabel('Trading Days')
-    axes[0, 1].set_ylabel('Cumulative Return (%)')
-    axes[0, 1].set_title('(b) Long-Short Portfolio')
+    axes[0, 1].set_ylabel(f'Cumulative Overlapping {HORIZON_DAYS}d Spread (%)')
+    axes[0, 1].set_title('(b) Long-Short Portfolio (overlapping, gross-of-frictions)')
     axes[0, 1].legend(fontsize=9)
     axes[0, 1].grid(True, alpha=0.3)
     axes[0, 1].axhline(0, color='gray', ls='--', lw=0.5)
@@ -699,7 +753,7 @@ def plot_publication_figures(pred, actual, dates, sigma, nu, X,
     axes[1].fill_between(range(len(rs)), 0, rs,
                           where=rs < 0, alpha=0.2, color='red')
     axes[1].set_xlabel('Trading Day')
-    axes[1].set_ylabel('60-Day Rolling Sharpe')
+    axes[1].set_ylabel('60-Day Rolling Sharpe (horizon-corrected)')
     axes[1].set_title('(b) Rolling Sharpe Ratio')
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
@@ -875,7 +929,9 @@ def print_summary_table(pred, actual, dates, sigma, nu, cost_results, h_ref=9):
 
     ics, _ = rank_ic_per_date(pred[:, h_ref], actual[:, h_ref], dates)
     ls_rets, _ = long_short_returns(pred[:, h_ref], actual[:, h_ref], dates)
-    tstat = ics.mean() / (ics.std() / np.sqrt(len(ics)))
+    # Newey-West t-stat: the daily IC series has MA(h_ref) autocorrelation
+    # from overlapping targets, so the naive iid t-stat is badly inflated.
+    tstat = newey_west_tstat(ics)
 
     pit = scipy_t.cdf(actual[:, h_ref], df=nu[:, h_ref],
                        loc=pred[:, h_ref], scale=sigma[:, h_ref])
@@ -889,14 +945,14 @@ def print_summary_table(pred, actual, dates, sigma, nu, cost_results, h_ref=9):
   \\midrule
   \\multicolumn{{2}}{{l}}{{\\textit{{Cross-Sectional Signal}}}} \\\\
   Rank IC (10d) & {ics.mean():.3f} $\\pm$ {ics.std():.3f} \\\\
-  IC $t$-statistic & {tstat:.1f} \\\\
+  IC $t$-statistic (Newey-West) & {tstat:.1f} \\\\
   IC positive days & {(ics>0).mean()*100:.0f}\\% \\\\
   \\midrule
-  \\multicolumn{{2}}{{l}}{{\\textit{{Long-Short Portfolio (h=10d)}}}} \\\\
+  \\multicolumn{{2}}{{l}}{{\\textit{{Long-Short Portfolio (h=10d; gross, horizon-corrected, survivor-biased universe --- upper bound)}}}} \\\\
   Annualized Sharpe (gross) & {sharpe(ls_rets):.2f} \\\\
   Annualized Sharpe (10 bps) & {cost_results['cost_scenarios']['10 bps (standard)']['sharpe']:.2f} \\\\
   Annualized Sharpe (30 bps) & {cost_results['cost_scenarios']['30 bps (conservative)']['sharpe']:.2f} \\\\
-  Win rate & {(ls_rets>0).mean()*100:.1f}\\% \\\\
+  Win rate (overlapping 10d windows) & {(ls_rets>0).mean()*100:.1f}\\% \\\\
   Max drawdown & {cost_results.get('max_dd', 0)*100:.1f}\\% \\\\
   Avg daily turnover & {cost_results['avg_turnover']*100:.1f}\\% \\\\
   \\midrule
@@ -945,7 +1001,9 @@ def main():
     h_ref = 9  # 10-day horizon
 
     # Run all analyses
-    cost_results = transaction_cost_analysis(mu[:, h_ref], Y_rel[:, h_ref], dates)
+    asset_ids = d['asset_id'] if 'asset_id' in d else None
+    cost_results = transaction_cost_analysis(mu[:, h_ref], Y_rel[:, h_ref], dates,
+                                             asset_ids=asset_ids)
     baseline_results = baseline_comparisons(X, Y_rel, dates, mu, h_ref)
 
     try:
@@ -980,23 +1038,27 @@ def main():
 
     nw_t = newey_west_tstat(ls_rets)
     ic_nw_t = newey_west_tstat(ics)
-    ann_ret = ls_rets.mean() * 365 * 100
-    ann_vol = ls_rets.std() * np.sqrt(365) * 100
+    # ls_rets are HORIZON_DAYS-day returns sampled daily (overlapping):
+    # annualized mean return is mean * 365 / HORIZON_DAYS, and the
+    # annualization of the volatility uses sqrt(365 / HORIZON_DAYS).
+    ann_ret = ls_rets.mean() * (365 / HORIZON_DAYS) * 100
+    ann_vol = ls_rets.std() * np.sqrt(365 / HORIZON_DAYS) * 100
     sh = sharpe(ls_rets)
     sort = sortino(ls_rets)
     calm = calmar(ls_rets)
     mdd = max_drawdown(ls_rets) * 100
 
     print(f"""
-  Strategy Performance (h=10d, top/bottom 20%, equal-weighted):
+  Strategy Performance (h=10d, top/bottom 20%, equal-weighted)
+  (gross, horizon-corrected, survivor-biased universe — upper bound):
   ─────────────────────────────────────────────────────────────
   Annualized return:        {ann_ret:>8.1f}%
   Annualized volatility:    {ann_vol:>8.1f}%
   Sharpe ratio:             {sh:>8.2f}
   Sortino ratio:            {sort:>8.2f}
   Calmar ratio:             {calm:>8.2f}
-  Max drawdown:             {mdd:>8.1f}%
-  Win rate:                 {(ls_rets>0).mean()*100:>8.1f}%
+  Max drawdown (overlapping series, indicative): {mdd:>8.1f}%
+  Win rate (overlapping 10d windows): {(ls_rets>0).mean()*100:>8.1f}%
   Avg daily turnover:       {cost_results['avg_turnover']*100:>8.1f}%
   Breakeven cost (1-way):   {cost_results['breakeven_bps']:>8.0f} bps
 
@@ -1073,6 +1135,15 @@ def main():
 
     # Save all results as JSON
     results = {
+        'methodology_note': (
+            'All portfolio metrics are gross, horizon-corrected (the L/S series '
+            f'is {HORIZON_DAYS}-day forward returns sampled daily; naive daily '
+            f'annualization would inflate Sharpe by ~sqrt({HORIZON_DAYS})), and '
+            'computed on a survivor-biased universe — upper bounds. win_rate is '
+            f'the share of positive overlapping {HORIZON_DAYS}-day windows, not '
+            'a daily win rate. Turnover requires asset_id mapping; without it '
+            'the estimate is unreliable.'
+        ),
         'step': step,
         'n_samples': len(X),
         'n_dates': len(np.unique(dates)),
