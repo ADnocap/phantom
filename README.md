@@ -6,28 +6,38 @@ A Transformer-based model that predicts full Student-*t* distributions of cross-
 
 ---
 
-## Key Results (fully out-of-sample, Jan 2025 - Mar 2026)
+## Key Results (out-of-sample Jan 2025 - Mar 2026; survivor-biased universe — see Limitations)
 
 | Metric | Value |
 |--------|-------|
-| **Rank IC (10d)** | 0.124 (Newey-West *t* = 8.93) |
-| **Long-Short Sharpe (net 30 bps)** | 11.84 |
-| **Win Rate** | 74.7% daily |
-| **Decile Monotonicity** | 1.000 (perfect) |
-| **Breakeven Cost** | 336 bps |
+| **Rank IC (10d)** | 0.124 (Newey-West *t* = 8.9; conservative overlap-adjusted lags still give *t* > 6) |
+| **Long-Short Sharpe (gross, horizon-corrected)** | ~4.1 upper bound (see Limitations; earlier releases reported 11.8-13.0 due to a 10-day-return annualization error) |
+| **Win Rate (10-day windows)** | 74.7% of overlapping 10-day holding windows |
+| **Quintile / Decile Monotonicity** | 1.000 / 0.988 |
+| **Breakeven Cost (horizon-corrected)** | ~34 bps one-way |
 | **IC Positive Months** | 15/15 |
 
 ### Main Results
 
 ![Main Results](plots/fig1_main_results.png)
 
-**(a)** Rank IC increases with horizon (0.08 at 1d to 0.17 at 30d). **(b)** Long-short cumulative returns survive 30 bps transaction costs. **(c)** Perfect decile monotonicity. **(d)** Phantom dominates all baselines.
+**(a)** Rank IC increases with horizon (0.08 at 1d to 0.17 at 30d; longer horizons overlap more heavily). **(b)** Cumulative overlapping 10-day L/S spreads — indicative of signal strength, not an implementable equity curve. **(c)** Near-perfect decile monotonicity (Spearman 0.99). **(d)** Phantom has the highest IC among directional baselines; a naive low-volatility sort achieves a higher raw IC (0.165 vs 0.124) — Phantom's incremental value is concentrated in mid/high-volatility names (see Limitations).
 
 ### Robustness
 
 ![Robustness](plots/fig2_robustness.png)
 
-IC positive in all 15 months. Rolling 60-day Sharpe always > 0 (min = 2.82). Turnover stable at 38%.
+IC positive in all 15 months. Rolling 60-day horizon-corrected Sharpe always > 0 (min ~0.9). Quintile-membership turnover stable at ~38%/day.
+
+---
+
+## Limitations (read before citing the numbers)
+
+1. **Survivorship bias**: the universe is all Binance USDT pairs with status TRADING at data-fetch time (Mar 2026). Pairs delisted at any point 2017-2026 — including during the test window — are excluded retroactively from training, testing, and the cross-sectional demeaning that defines the target. Reported IC and spreads are upper bounds on live performance.
+2. **Overlapping-return annualization**: the L/S series is built from 10-day forward returns sampled daily. Earlier claims (Sharpe 11.8-13.0, 925% annualized, 74.7% *daily* win rate, 336 bps breakeven, 2.53%/day spread) annualized these as daily returns, a ~sqrt(10) Sharpe inflation. Corrected: gross Sharpe ~4.1, ~93% annualized gross, breakeven ~34 bps one-way.
+3. **Implementability**: legs are equal-weighted with no liquidity screen; many bottom-quintile pairs have no margin/perp market (the short leg is partly unimplementable); no spread, impact, or borrow costs are modeled. The signal's incremental IC is concentrated in high-volatility, low-liquidity names. Realistic net-of-cost performance is plausibly in the 1-2 Sharpe range.
+4. **Low-vol overlap**: the signal is 0.63 rank-correlated with inverse trailing volatility, and a naive low-vol sort has higher raw IC (0.165). Phantom's independent contribution is significant only within mid/high-vol terciles (t = 2.6 / 4.1).
+5. **Inference**: Newey-West lags (Andrews rule, 5) under-correct for the MA(9) overlap in the daily IC series; conservative lags reduce the IC t-stat from 8.9 to roughly 6-7. There are ~43 independent 10-day periods in the sample.
 
 ---
 
@@ -46,7 +56,7 @@ IC positive in all 15 months. Rolling 60-day Sharpe always > 0 (min = 2.82). Tur
 The model predicts **relative returns** (asset return minus cross-sectional mean), isolating idiosyncratic signal from shared market factors. This is the key insight that unlocks cross-sectional predictability:
 
 - **Absolute returns** from OHLCV are unpredictable at any horizon (consistent with weak-form EMH)
-- **Relative returns** contain ranking signal concentrated in crypto (IC = 0.124)
+- **Relative returns** contain ranking signal concentrated in crypto (IC = 0.124 on a survivor universe; partially overlapping the low-volatility effect — see Limitations)
 
 ### Two-Stage Training
 
@@ -69,7 +79,9 @@ Eight model versions systematically test the design space:
 | **v5** | **Relative returns** | **0.09** | **4.6** | **Signal unlocked** |
 | v6 | + Funding rate, taker buy | 0.14 | 5.5 | Features don't help; crypto-only helps |
 | v7 | 4h bars | 0.10 | 2.6 | Worse: 99.7% sample overlap, signal is daily |
-| **v8** | **362 crypto assets** | **0.12** | **13.0** | **Sharpe doubles via diversification** |
+| **v8** | **362 crypto assets** | **0.12** | **~4.1*** | **Breadth improves L/S diversification; IC slightly lower than v6** |
+
+\* Sharpe values in this table were originally computed by annualizing overlapping 10-day returns with sqrt(365), inflating them by ~sqrt(10); the corrected v8 gross figure is shown. All are gross, equal-weighted, on a survivor universe.
 
 ---
 
